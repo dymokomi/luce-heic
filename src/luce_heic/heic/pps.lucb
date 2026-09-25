@@ -1,0 +1,171 @@
+#==============================================================================================
+#
+#   heic/pps - Picture parameter sets, and the SPS video usability information
+#
+#==============================================================================================
+
+## The largest tile grid accepted (HEVC level 6.2 allows 20 columns and 22 rows).
+let max_tile_columns: usize = 64
+let max_tile_rows: usize = 64
+
+## The parts of a PPS the decoder uses.
+struct Pps:
+    var present: bool
+    var sps: u32
+    var dependent_slices: bool
+    var output_flag: bool
+    var extra_bits: u32
+    var sign_hiding: bool
+    var init_qp: i32
+    var transform_skip: bool
+    var cu_qp_delta: bool
+    var qp_delta_depth: u32
+    var cb_offset: i32
+    var cr_offset: i32
+    var slice_chroma_offsets: bool
+    var bypass: bool
+    var tiles: bool
+    var wpp: bool
+    var columns: usize
+    var rows: usize
+    var uniform: bool
+    var column_widths: u32[64]
+    var row_heights: u32[64]
+    var across_tiles: bool
+    var across_slices: bool
+    var deblock_override: bool
+    var deblock_disabled: bool
+    var beta_offset: i32
+    var tc_offset: i32
+    var scaling_present: bool
+    var scaling: Scaling
+    var header_extension: bool
+
+## pic_parameter_set_rbsp(): stores the PPS by its ID in `table`.
+func parse_pps(bits: Bits*, table: Pps[]) -> !:
+    let id = (usize)(try bits.ue_max(63))
+    let pps = &table[id]
+    *pps = Pps(columns = 1, rows = 1, uniform = true)
+    pps.sps = try bits.ue_max(15)
+    pps.dependent_slices = try bits.flag()
+    pps.output_flag = try bits.flag()
+    pps.extra_bits = try bits.bits(3)
+    pps.sign_hiding = try bits.flag()
+    discard(try bits.flag())
+    discard(try bits.ue_max(14))
+    discard(try bits.ue_max(14))
+    pps.init_qp = 26 + try bits.se_range(-62, 25)
+    discard(try bits.flag())
+    pps.transform_skip = try bits.flag()
+    pps.cu_qp_delta = try bits.flag()
+    if pps.cu_qp_delta:
+        pps.qp_delta_depth = try bits.ue_max(3)
+    pps.cb_offset = try bits.se_range(-12, 12)
+    pps.cr_offset = try bits.se_range(-12, 12)
+    pps.slice_chroma_offsets = try bits.flag()
+    discard(try bits.flag())
+    discard(try bits.flag())
+    pps.bypass = try bits.flag()
+    pps.tiles = try bits.flag()
+    pps.wpp = try bits.flag()
+    if pps.tiles:
+        pps.columns = (usize)(try bits.ue()) + 1
+        pps.rows = (usize)(try bits.ue()) + 1
+        if pps.columns > max_tile_columns or pps.rows > max_tile_rows:
+            error(unsupported, "HEVC picture has too many tiles")
+        pps.uniform = try bits.flag()
+        if not pps.uniform:
+            for i in 0..<pps.columns - 1:
+                pps.column_widths[i] = try bits.ue_max(4095) + 1
+            for i in 0..<pps.rows - 1:
+                pps.row_heights[i] = try bits.ue_max(4095) + 1
+        pps.across_tiles = try bits.flag()
+    pps.across_slices = try bits.flag()
+    if try bits.flag():
+        pps.deblock_override = try bits.flag()
+        pps.deblock_disabled = try bits.flag()
+        if not pps.deblock_disabled:
+            pps.beta_offset = try bits.se_range(-6, 6) * 2
+            pps.tc_offset = try bits.se_range(-6, 6) * 2
+    pps.scaling_present = try bits.flag()
+    if pps.scaling_present:
+        try parse_scaling(bits, &pps.scaling)
+    discard(try bits.flag())
+    discard(try bits.ue_max(4))
+    pps.header_extension = try bits.flag()
+    if try bits.flag():
+        let range = try bits.flag()
+        if try bits.bits(7) != 0:
+            error(unsupported, "HEVC multilayer, 3D and screen content extensions are not supported")
+        if range:
+            if pps.transform_skip and try bits.ue() != 0:
+                error(unsupported, "HEVC transform skip above 4x4 is not supported")
+            if try bits.flag() or try bits.flag():
+                error(unsupported, "HEVC cross-component prediction and chroma QP offset lists are not supported")
+            if try bits.ue() != 0 or try bits.ue() != 0:
+                error(unsupported, "HEVC SAO offset scaling is not supported")
+    pps.present = true
+
+## vui_parameters(): only the video signal type is kept; the rest is skipped so that the
+## SPS extension flags after it can be checked.
+func parse_vui(bits: Bits*, sps: Sps*, sub_layers: u32) -> !:
+    if try bits.flag() and try bits.bits(8) == 255:
+        try bits.skip(32)
+    if try bits.flag():
+        discard(try bits.flag())
+    if try bits.flag():
+        discard(try bits.bits(3))
+        sps.full_range = (i32)(try bits.bit())
+        if try bits.flag():
+            discard(try bits.bits(16))
+            sps.matrix = (i32)(try bits.bits(8))
+    if try bits.flag():
+        discard(try bits.ue())
+        discard(try bits.ue())
+    try bits.skip(3)
+    if try bits.flag():
+        for i in 0..<(usize)4:
+            discard(try bits.ue())
+    if try bits.flag():
+        try bits.skip(64)
+        if try bits.flag():
+            discard(try bits.ue())
+        if try bits.flag():
+            try parse_hrd(bits, sub_layers)
+    if try bits.flag():
+        try bits.skip(3)
+        for i in 0..<(usize)5:
+            discard(try bits.ue())
+
+## hrd_parameters(1, sub_layers), skipped.
+func parse_hrd(bits: Bits*, sub_layers: u32) -> !:
+    let nal = try bits.flag()
+    let vcl = try bits.flag()
+    var sub_picture = false
+    if nal or vcl:
+        sub_picture = try bits.flag()
+        if sub_picture:
+            try bits.skip(19)
+        try bits.skip(8)
+        if sub_picture:
+            try bits.skip(4)
+        try bits.skip(15)
+    for i in 0..=(usize)sub_layers:
+        let general = try bits.flag()
+        let within = general or try bits.flag()
+        var low_delay = false
+        if within:
+            discard(try bits.ue())
+        else:
+            low_delay = try bits.flag()
+        var count: u32 = 1
+        if not low_delay:
+            count = try bits.ue_max(31) + 1
+        for layer in 0..<(usize)((1 if nal else 0) + (1 if vcl else 0)):
+            for k in 0..<count:
+                discard(try bits.ue())
+                discard(try bits.ue())
+                if sub_picture:
+                    discard(try bits.ue())
+                    discard(try bits.ue())
+                discard(try bits.flag())

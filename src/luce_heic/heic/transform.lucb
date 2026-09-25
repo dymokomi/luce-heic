@@ -1,0 +1,159 @@
+#==============================================================================================
+#
+#   heic/transform - Scaling (dequantisation), the inverse transforms and reconstruction
+#   (8.6.2 to 8.6.4): the 4x4 DST for intra luma, the 4- to 32-point DCT, transform skip
+#   and lossless (transquant bypass) blocks. Columns and rows beyond the last non-zero
+#   coefficient are skipped, which leaves the result unchanged.
+#
+#==============================================================================================
+
+## levelScale by qP % 6.
+let level_scale: i64[6] = [40, 45, 51, 57, 64, 72]
+
+## The 4x4 DST basis (8-315), row k being frequency k.
+let dst4: i32[16] = [29, 55, 74, 84, 74, 74, 0, -74, 84, -29, -74, 55, 55, -84, 74, -29]
+
+## The 32-point DCT basis, row k being frequency k; the N-point basis is every (32 / N)th
+## row's first N entries.
+let dct32: i8[1024] = [
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4, -4, -13, -22, -31, -38, -46, -54, -61, -67, -73, -78, -82, -85, -88, -90, -90,
+    90, 87, 80, 70, 57, 43, 25, 9, -9, -25, -43, -57, -70, -80, -87, -90, -90, -87, -80, -70, -57, -43, -25, -9, 9, 25, 43, 57, 70, 80, 87, 90,
+    90, 82, 67, 46, 22, -4, -31, -54, -73, -85, -90, -88, -78, -61, -38, -13, 13, 38, 61, 78, 88, 90, 85, 73, 54, 31, 4, -22, -46, -67, -82, -90,
+    89, 75, 50, 18, -18, -50, -75, -89, -89, -75, -50, -18, 18, 50, 75, 89, 89, 75, 50, 18, -18, -50, -75, -89, -89, -75, -50, -18, 18, 50, 75, 89,
+    88, 67, 31, -13, -54, -82, -90, -78, -46, -4, 38, 73, 90, 85, 61, 22, -22, -61, -85, -90, -73, -38, 4, 46, 78, 90, 82, 54, 13, -31, -67, -88,
+    87, 57, 9, -43, -80, -90, -70, -25, 25, 70, 90, 80, 43, -9, -57, -87, -87, -57, -9, 43, 80, 90, 70, 25, -25, -70, -90, -80, -43, 9, 57, 87,
+    85, 46, -13, -67, -90, -73, -22, 38, 82, 88, 54, -4, -61, -90, -78, -31, 31, 78, 90, 61, 4, -54, -88, -82, -38, 22, 73, 90, 67, 13, -46, -85,
+    83, 36, -36, -83, -83, -36, 36, 83, 83, 36, -36, -83, -83, -36, 36, 83, 83, 36, -36, -83, -83, -36, 36, 83, 83, 36, -36, -83, -83, -36, 36, 83,
+    82, 22, -54, -90, -61, 13, 78, 85, 31, -46, -90, -67, 4, 73, 88, 38, -38, -88, -73, -4, 67, 90, 46, -31, -85, -78, -13, 61, 90, 54, -22, -82,
+    80, 9, -70, -87, -25, 57, 90, 43, -43, -90, -57, 25, 87, 70, -9, -80, -80, -9, 70, 87, 25, -57, -90, -43, 43, 90, 57, -25, -87, -70, 9, 80,
+    78, -4, -82, -73, 13, 85, 67, -22, -88, -61, 31, 90, 54, -38, -90, -46, 46, 90, 38, -54, -90, -31, 61, 88, 22, -67, -85, -13, 73, 82, 4, -78,
+    75, -18, -89, -50, 50, 89, 18, -75, -75, 18, 89, 50, -50, -89, -18, 75, 75, -18, -89, -50, 50, 89, 18, -75, -75, 18, 89, 50, -50, -89, -18, 75,
+    73, -31, -90, -22, 78, 67, -38, -90, -13, 82, 61, -46, -88, -4, 85, 54, -54, -85, 4, 88, 46, -61, -82, 13, 90, 38, -67, -78, 22, 90, 31, -73,
+    70, -43, -87, 9, 90, 25, -80, -57, 57, 80, -25, -90, -9, 87, 43, -70, -70, 43, 87, -9, -90, -25, 80, 57, -57, -80, 25, 90, 9, -87, -43, 70,
+    67, -54, -78, 38, 85, -22, -90, 4, 90, 13, -88, -31, 82, 46, -73, -61, 61, 73, -46, -82, 31, 88, -13, -90, -4, 90, 22, -85, -38, 78, 54, -67,
+    64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64, 64, -64, -64, 64,
+    61, -73, -46, 82, 31, -88, -13, 90, -4, -90, 22, 85, -38, -78, 54, 67, -67, -54, 78, 38, -85, -22, 90, 4, -90, 13, 88, -31, -82, 46, 73, -61,
+    57, -80, -25, 90, -9, -87, 43, 70, -70, -43, 87, 9, -90, 25, 80, -57, -57, 80, 25, -90, 9, 87, -43, -70, 70, 43, -87, -9, 90, -25, -80, 57,
+    54, -85, -4, 88, -46, -61, 82, 13, -90, 38, 67, -78, -22, 90, -31, -73, 73, 31, -90, 22, 78, -67, -38, 90, -13, -82, 61, 46, -88, 4, 85, -54,
+    50, -89, 18, 75, -75, -18, 89, -50, -50, 89, -18, -75, 75, 18, -89, 50, 50, -89, 18, 75, -75, -18, 89, -50, -50, 89, -18, -75, 75, 18, -89, 50,
+    46, -90, 38, 54, -90, 31, 61, -88, 22, 67, -85, 13, 73, -82, 4, 78, -78, -4, 82, -73, -13, 85, -67, -22, 88, -61, -31, 90, -54, -38, 90, -46,
+    43, -90, 57, 25, -87, 70, 9, -80, 80, -9, -70, 87, -25, -57, 90, -43, -43, 90, -57, -25, 87, -70, -9, 80, -80, 9, 70, -87, 25, 57, -90, 43,
+    38, -88, 73, -4, -67, 90, -46, -31, 85, -78, 13, 61, -90, 54, 22, -82, 82, -22, -54, 90, -61, -13, 78, -85, 31, 46, -90, 67, 4, -73, 88, -38,
+    36, -83, 83, -36, -36, 83, -83, 36, 36, -83, 83, -36, -36, 83, -83, 36, 36, -83, 83, -36, -36, 83, -83, 36, 36, -83, 83, -36, -36, 83, -83, 36,
+    31, -78, 90, -61, 4, 54, -88, 82, -38, -22, 73, -90, 67, -13, -46, 85, -85, 46, 13, -67, 90, -73, 22, 38, -82, 88, -54, -4, 61, -90, 78, -31,
+    25, -70, 90, -80, 43, 9, -57, 87, -87, 57, -9, -43, 80, -90, 70, -25, -25, 70, -90, 80, -43, -9, 57, -87, 87, -57, 9, 43, -80, 90, -70, 25,
+    22, -61, 85, -90, 73, -38, -4, 46, -78, 90, -82, 54, -13, -31, 67, -88, 88, -67, 31, 13, -54, 82, -90, 78, -46, 4, 38, -73, 90, -85, 61, -22,
+    18, -50, 75, -89, 89, -75, 50, -18, -18, 50, -75, 89, -89, 75, -50, 18, 18, -50, 75, -89, 89, -75, 50, -18, -18, 50, -75, 89, -89, 75, -50, 18,
+    13, -38, 61, -78, 88, -90, 85, -73, 54, -31, 4, 22, -46, 67, -82, 90, -90, 82, -67, 46, -22, -4, 31, -54, 73, -85, 90, -88, 78, -61, 38, -13,
+    9, -25, 43, -57, 70, -80, 87, -90, 90, -87, 80, -70, 57, -43, 25, -9, -9, 25, -43, 57, -70, 80, -87, 90, -90, 87, -80, 70, -57, 43, -25, 9,
+    4, -13, 22, -31, 38, -46, 54, -61, 67, -73, 78, -82, 85, -88, 90, -90, 90, -90, 88, -85, 82, -78, 73, -67, 61, -54, 46, -38, 31, -22, 13, -4,
+]
+
+## Dequantises the parsed levels in `c.coeffs` for component `component`, transforms
+## them and adds the residual to the prediction already in the plane at (x0, y0).
+## Coefficients beyond (`max_x`, `max_y`) are zero.
+func reconstruct(c: Ctx*, component: u32, x0: usize, y0: usize, log2: u32, skip: bool, max_x: usize, max_y: usize) -> !:
+    let pic = c.pic
+    let n = (usize)1 << log2
+    let depth = pic.bits if component == 0 else pic.bits_c
+    if not c.bypass:
+        let qp = (c.qp_y + 6 * (i32)(pic.bits - 8) if component == 0 else c.qp_cb if component == 1 else c.qp_cr)
+        if qp < 0:
+            error(corrupt, "HEVC quantisation parameter is negative")
+        let scale = level_scale[(usize)(qp % 6)] << (u32)(qp // 6)
+        let shift = (u32)depth + log2 - 5
+        let add = (i64)1 << (shift - 1)
+        let flat = not c.sps.scaling_enabled or (skip and n > 4)
+        for y in 0..=max_y:
+            for x in 0..=max_x:
+                let v = (i64)c.coeffs[y * n + x]
+                if v != 0:
+                    let m: i64 = 16 if flat else (i64)c.scaling.factor(log2, component, x, y)
+                    let d = (v * m * scale + add) >> shift
+                    c.coeffs[y * n + x] = (i32)(-32768 if d < -32768 else 32767 if d > 32767 else d)
+        let final_shift = 20 - depth
+        let round = (i32)1 << (final_shift - 1)
+        let dst = component == 0 and log2 == 2
+        if skip:
+            for i in 0..<n * n:
+                c.coeffs[i] = ((c.coeffs[i] << 7) + round) >> final_shift
+        elif max_x == 0 and max_y == 0 and not dst:
+            # Only the DC coefficient: both DCT stages give a constant (64 · d, twice).
+            let g = (64 * c.coeffs[0] + 64) >> 7
+            let dc = (64 * (-32768 if g < -32768 else 32767 if g > 32767 else g) + round) >> final_shift
+            for i in 0..<n * n:
+                c.coeffs[i] = dc
+        else:
+            inverse_transform(c, log2, dst, max_x, max_y, final_shift)
+    let plane = pic.plane(component)
+    let stride = pic.width if component == 0 else pic.cwidth
+    let high = ((i32)1 << depth) - 1
+    for y in 0..<n:
+        let row = (y0 + y) * stride + x0
+        for x in 0..<n:
+            let v = (i32)plane[row + x] + c.coeffs[y * n + x]
+            plane[row + x] = (u16)(0 if v < 0 else high if v > high else v)
+
+## The two-stage inverse transform of `c.coeffs` in place (8.6.4.2), with the
+## intermediate clipping and the final `shift` of 8.6.2.
+func inverse_transform(c: Ctx*, log2: u32, dst: bool, max_x: usize, max_y: usize, shift: u32):
+    let n = (usize)1 << log2
+    var line: i32[32] = ---
+    var out: i32[32] = ---
+    for i in 0..<n * n:
+        c.temp[i] = 0
+    # Columns: e[x][y] = sum over k of M[k][y] d[x][k].
+    for x in 0..=max_x:
+        for k in 0..<n:
+            line[k] = c.coeffs[k * n + x]
+        inverse_line(line, n, max_y + 1, dst, out)
+        for y in 0..<n:
+            let g = (out[y] + 64) >> 7
+            c.temp[y * n + x] = -32768 if g < -32768 else 32767 if g > 32767 else g
+    # Rows: r[x][y] = sum over k of M[k][x] g[k][y].
+    let round = (i32)1 << (shift - 1)
+    for y in 0..<n:
+        for k in 0..<n:
+            line[k] = c.temp[y * n + k]
+        inverse_line(line, n, max_x + 1, dst, out)
+        for x in 0..<n:
+            c.coeffs[y * n + x] = (out[x] + round) >> shift
+
+## One 1-D inverse transform of `n` points: coefficients `input` (zero from `count` on)
+## to samples `output`. The DST is a plain matrix product; the DCT splits into its even
+## part, an n/2-point DCT of the even coefficients, and its odd part, as the reference
+## decoder's partial butterflies do.
+func inverse_line(input: const i32[], n: usize, count: usize, dst: bool, output: i32[]):
+    if dst:
+        for i in 0..<(usize)4:
+            var sum: i32 = 0
+            for k in 0..<count:
+                sum += dst4[k * 4 + i] * input[k]
+            output[i] = sum
+        return
+    if n == 4:
+        let e0 = 64 * (input[0] + input[2])
+        let e1 = 64 * (input[0] - input[2])
+        let o0 = 83 * input[1] + 36 * input[3]
+        let o1 = 36 * input[1] - 83 * input[3]
+        output[0] = e0 + o0
+        output[1] = e1 + o1
+        output[2] = e1 - o1
+        output[3] = e0 - o0
+        return
+    let half = n >> 1
+    let row = ((usize)32 // n) * 32
+    var evens: i32[16] = ---
+    var even: i32[16] = ---
+    for k in 0..<half:
+        evens[k] = input[2 * k]
+    inverse_line(evens, half, (count + 1) >> 1, false, even)
+    for k in 0..<half:
+        var odd: i32 = 0
+        var j: usize = 1
+        while j < count:
+            odd += (i32)dct32[j * row + k] * input[j]
+            j += 2
+        output[k] = even[k] + odd
+        output[n - 1 - k] = even[k] - odd

@@ -1,0 +1,283 @@
+#==============================================================================================
+#
+#   heic/params - Sequence and picture parameter sets, and scaling lists
+#
+#   Only what an intra decoder needs is kept; the rest is parsed to stay in step. Range,
+#   multilayer, 3D and screen-content extensions that change decoding are refused.
+#
+#==============================================================================================
+
+## Table 7-6: the default 8x8 intra and inter scaling lists in up-right diagonal order.
+let default_intra: u8[64] = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18, 17, 18, 18, 17, 18, 21, 19, 20, 21, 20, 19, 21, 24, 22, 22, 24, 24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35, 35, 31, 29, 36, 41, 44, 41, 36, 47, 54, 54, 47, 65, 70, 65, 88, 88, 115]
+let default_inter: u8[64] = [16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 20, 20, 20, 20, 20, 20, 20, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28, 28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91]
+
+## Up-right diagonal scans: position `i` as x | y << 2 in a 4x4 block, x | y << 3 in 8x8.
+let diag4: u8[16] = [0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15]
+let diag8: u8[64] = [0, 8, 1, 16, 9, 2, 24, 17, 10, 3, 32, 25, 18, 11, 4, 40, 33, 26, 19, 12, 5, 48, 41, 34, 27, 20, 13, 6, 56, 49, 42, 35, 28, 21, 14, 7, 57, 50, 43, 36, 29, 22, 15, 58, 51, 44, 37, 30, 23, 59, 52, 45, 38, 31, 60, 53, 46, 39, 61, 54, 47, 62, 55, 63]
+
+## Scaling factors for every size (4x4 to 32x32) and matrix (intra Y, Cb, Cr, inter Y, Cb,
+## Cr), each an 8x8 raster (4x4 uses its first 16 entries as a 4x4 raster) that larger
+## blocks upsample, plus the DC factors of 16x16 and 32x32.
+struct Scaling:
+    var factors: u8[1536]
+    var dc: u8[12]
+
+    ## The factor for coefficient (x, y) of a 2^log2 block of `matrix`.
+    func factor(log2: u32, matrix: u32, x: usize, y: usize) -> i32:
+        let size = (usize)log2 - 2
+        let base = (size * 6 + (usize)matrix) * 64
+        if size == 0:
+            return (i32)self.factors[base + y * 4 + x]
+        if size >= 2 and x == 0 and y == 0:
+            return (i32)self.dc[(size - 2) * 6 + (usize)matrix]
+        let shift = size - 1
+        return (i32)self.factors[base + (y >> shift) * 8 + (x >> shift)]
+
+    ## Sets matrix `matrix` of size `size` to its default.
+    mutating func reset(size: usize, matrix: usize):
+        let base = (size * 6 + matrix) * 64
+        for i in 0..<(usize)64:
+            if size == 0:
+                self.factors[base + i] = 16
+            else:
+                self.factors[base + (usize)diag8[i]] = default_intra[i] if matrix < 3 else default_inter[i]
+        if size >= 2:
+            self.dc[(size - 2) * 6 + matrix] = 16
+
+    mutating func defaults():
+        for size in 0..<(usize)4:
+            for matrix in 0..<(usize)6:
+                self.reset(size, matrix)
+
+## scaling_list_data(): each list is predicted from a default or earlier list, or coded as
+## differences in diagonal order.
+func parse_scaling(bits: Bits*, s: Scaling*) -> !:
+    s.defaults()
+    for size in 0..<(usize)4:
+        let step: usize = 3 if size == 3 else 1
+        var matrix: usize = 0
+        while matrix < 6:
+            let base = (size * 6 + matrix) * 64
+            if not try bits.flag():
+                let delta = (usize)(try bits.ue_max(5)) * step
+                if delta > matrix:
+                    error(corrupt, "HEVC scaling list refers to a missing list")
+                if delta == 0:
+                    s.reset(size, matrix)
+                else:
+                    let source = (size * 6 + matrix - delta) * 64
+                    for i in 0..<(usize)64:
+                        s.factors[base + i] = s.factors[source + i]
+                    if size >= 2:
+                        s.dc[(size - 2) * 6 + matrix] = s.dc[(size - 2) * 6 + matrix - delta]
+            else:
+                var next: i32 = 8
+                if size >= 2:
+                    next = try bits.se_range(-7, 247) + 8
+                    s.dc[(size - 2) * 6 + matrix] = (u8)next
+                let count: usize = 16 if size == 0 else 64
+                for i in 0..<count:
+                    next = (next + (try bits.se_range(-128, 127)) + 256) % 256
+                    if next == 0:
+                        error(corrupt, "HEVC scaling list value is zero")
+                    s.factors[base + ((usize)diag4[i] if size == 0 else (usize)diag8[i])] = (u8)next
+            matrix += step
+
+## profile_tier_level(1, max_sub_layers_minus1); returns general_profile_idc.
+func parse_ptl(bits: Bits*, sub_layers: u32) -> u32!:
+    discard(try bits.bits(3))
+    let profile = try bits.bits(5)
+    try bits.skip(32 + 48 + 8)
+    var present: u32[8]
+    for i in 0..<(usize)sub_layers:
+        present[i] = try bits.bits(2)
+    if sub_layers > 0:
+        try bits.skip((usize)(8 - sub_layers) * 2)
+    for i in 0..<(usize)sub_layers:
+        if (present[i] & 2) != 0:
+            try bits.skip(88)
+        if (present[i] & 1) != 0:
+            try bits.skip(8)
+    return profile
+
+## The parts of an SPS the decoder uses.
+struct Sps:
+    var present: bool
+    var chroma: u32
+    var width: usize
+    var height: usize
+    var crop_left: usize
+    var crop_right: usize
+    var crop_top: usize
+    var crop_bottom: usize
+    var bits: u32
+    var bits_c: u32
+    var log2_poc: u32
+    var log2_min_cb: u32
+    var log2_ctb: u32
+    var log2_min_tb: u32
+    var log2_max_tb: u32
+    var depth_intra: u32
+    var scaling_enabled: bool
+    var scaling: Scaling
+    var sao: bool
+    var pcm: bool
+    var pcm_bits: u32
+    var pcm_bits_c: u32
+    var log2_min_pcm: u32
+    var log2_max_pcm: u32
+    var pcm_loop_filter_disabled: bool
+    var rps_count: u32
+    ## NumDeltaPocs of each short-term reference picture set, for slice headers.
+    var rps_deltas: u8[65]
+    var long_term: bool
+    var long_term_count: u32
+    var temporal_mvp: bool
+    var strong_smoothing: bool
+    ## VUI video signal type: -1 when absent.
+    var full_range: i32
+    var matrix: i32
+
+## st_ref_pic_set(index): records NumDeltaPocs; `deltas` holds each set's DeltaPoc values
+## (16 negative then 16 positive) for inter-set prediction.
+func parse_rps(bits: Bits*, sps: Sps*, index: u32, deltas: i32[]) -> !:
+    var predicted = false
+    if index != 0:
+        predicted = try bits.flag()
+    var values: i32[32]
+    var count: usize = 0
+    if predicted:
+        var delta_index: u32 = 1
+        if index == sps.rps_count:
+            delta_index = try bits.ue_max(index - 1) + 1
+        let sign = try bits.flag()
+        let magnitude = (i32)(try bits.ue_max(32767)) + 1
+        let delta_rps = -magnitude if sign else magnitude
+        let reference = (usize)(index - delta_index)
+        let reference_count = (usize)sps.rps_deltas[reference]
+        for j in 0..=reference_count:
+            let used = try bits.flag()
+            let use_delta = used or try bits.flag()
+            let delta = delta_rps + (deltas[reference * 32 + j] if j < reference_count else 0)
+            if use_delta and delta != 0:
+                if count >= 32:
+                    error(corrupt, "HEVC reference picture set is too large")
+                values[count] = delta
+                count += 1
+    else:
+        let negative = try bits.ue_max(16)
+        let positive = try bits.ue_max(16)
+        var poc: i32 = 0
+        for i in 0..<(usize)negative:
+            poc -= (i32)(try bits.ue_max(32767)) + 1
+            discard(try bits.flag())
+            values[count] = poc
+            count += 1
+        poc = 0
+        for i in 0..<(usize)positive:
+            poc += (i32)(try bits.ue_max(32767)) + 1
+            discard(try bits.flag())
+            values[count] = poc
+            count += 1
+    if count > 16:
+        error(corrupt, "HEVC reference picture set is too large")
+    # Order as DeltaPocS0 (nearest first) then DeltaPocS1 (nearest first).
+    for i in 1..<count:
+        var j = i
+        while j > 0 and rps_before(values[j], values[j - 1]):
+            let swap = values[j]
+            values[j] = values[j - 1]
+            values[j - 1] = swap
+            j -= 1
+    if index < 65:
+        sps.rps_deltas[index] = (u8)count
+        if index < 64:
+            for j in 0..<count:
+                deltas[(usize)index * 32 + j] = values[j]
+
+## Whether DeltaPoc `a` comes before `b`: negatives first, each side nearest first.
+func rps_before(a: i32, b: i32) -> bool:
+    if (a < 0) != (b < 0):
+        return a < 0
+    return a > b if a < 0 else a < b
+
+## seq_parameter_set_rbsp(): stores the SPS by its ID in `table`.
+func parse_sps(bits: Bits*, table: Sps[]) -> !:
+    discard(try bits.bits(4))
+    let sub_layers = try bits.bits(3)
+    if sub_layers > 6:
+        error(corrupt, "invalid HEVC sub-layer count")
+    discard(try bits.flag())
+    let profile = try parse_ptl(bits, sub_layers)
+    let id = (usize)(try bits.ue_max(15))
+    let sps = &table[id]
+    *sps = Sps(full_range = -1, matrix = -1)
+    sps.chroma = try bits.ue_max(3)
+    if sps.chroma > 1:
+        error(unsupported, "HEVC 4:2:2 and 4:4:4 chroma are not supported")
+    if profile > 4 and profile != 0:
+        error(unsupported, "unsupported HEVC profile")
+    sps.width = (usize)(try bits.ue())
+    sps.height = (usize)(try bits.ue())
+    if try bits.flag():
+        let crop_unit: usize = 2 if sps.chroma == 1 else 1
+        sps.crop_left = (usize)(try bits.ue()) * crop_unit
+        sps.crop_right = (usize)(try bits.ue()) * crop_unit
+        sps.crop_top = (usize)(try bits.ue()) * crop_unit
+        sps.crop_bottom = (usize)(try bits.ue()) * crop_unit
+    sps.bits = try bits.ue_max(4) + 8
+    sps.bits_c = try bits.ue_max(4) + 8
+    sps.log2_poc = try bits.ue_max(12) + 4
+    let ordering = try bits.flag()
+    for i in (0 if ordering else sub_layers)..=sub_layers:
+        discard(try bits.ue())
+        discard(try bits.ue())
+        discard(try bits.ue())
+    sps.log2_min_cb = try bits.ue_max(3) + 3
+    sps.log2_ctb = sps.log2_min_cb + try bits.ue_max(3)
+    sps.log2_min_tb = try bits.ue_max(3) + 2
+    sps.log2_max_tb = sps.log2_min_tb + try bits.ue_max(3)
+    if sps.log2_ctb < 4 or sps.log2_ctb > 6 or sps.log2_max_tb > 5 or sps.log2_max_tb > sps.log2_ctb or sps.log2_min_tb >= sps.log2_min_cb:
+        error(corrupt, "invalid HEVC block sizes")
+    if sps.width == 0 or sps.height == 0 or sps.width > 16384 or sps.height > 16384 or sps.width % ((usize)1 << sps.log2_min_cb) != 0 or sps.height % ((usize)1 << sps.log2_min_cb) != 0:
+        error(corrupt, "invalid HEVC picture size")
+    if sps.crop_left + sps.crop_right >= sps.width or sps.crop_top + sps.crop_bottom >= sps.height:
+        error(corrupt, "invalid HEVC conformance window")
+    discard(try bits.ue_max(5))
+    sps.depth_intra = try bits.ue_max(5)
+    sps.scaling_enabled = try bits.flag()
+    sps.scaling.defaults()
+    if sps.scaling_enabled and try bits.flag():
+        try parse_scaling(bits, &sps.scaling)
+    discard(try bits.flag())
+    sps.sao = try bits.flag()
+    sps.pcm = try bits.flag()
+    if sps.pcm:
+        sps.pcm_bits = try bits.bits(4) + 1
+        sps.pcm_bits_c = try bits.bits(4) + 1
+        sps.log2_min_pcm = try bits.ue_max(2) + 3
+        sps.log2_max_pcm = sps.log2_min_pcm + try bits.ue_max(2)
+        sps.pcm_loop_filter_disabled = try bits.flag()
+        if sps.pcm_bits > sps.bits or sps.pcm_bits_c > sps.bits_c or sps.log2_max_pcm > 5:
+            error(corrupt, "invalid HEVC PCM parameters")
+    sps.rps_count = try bits.ue_max(64)
+    var deltas: i32[2048]
+    for i in 0..<sps.rps_count:
+        try parse_rps(bits, sps, i, deltas)
+    sps.long_term = try bits.flag()
+    if sps.long_term:
+        sps.long_term_count = try bits.ue_max(32)
+        for i in 0..<sps.long_term_count:
+            discard(try bits.bits(sps.log2_poc))
+            discard(try bits.flag())
+    sps.temporal_mvp = try bits.flag()
+    sps.strong_smoothing = try bits.flag()
+    if try bits.flag():
+        try parse_vui(bits, sps, sub_layers)
+    if try bits.flag():
+        let range = try bits.flag()
+        if try bits.bits(7) != 0:
+            error(unsupported, "HEVC multilayer, 3D and screen content extensions are not supported")
+        if range and try bits.bits(9) != 0:
+            error(unsupported, "HEVC range extension tools are not supported")
+    sps.present = true

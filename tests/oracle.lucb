@@ -1,0 +1,192 @@
+#==============================================================================================
+#
+#   oracle - The corpus gate: decodes every file in tests/corpus/manifest.txt and checks it
+#
+#   rgb entries compare the full decode with a PNG made by macOS's own HEIC decoder (sips)
+#   within a tolerance in 8-bit levels; planes entries compare a CRC32 of the decoded
+#   YCbCr planes with FFmpeg's decode of the same HEVC stream, which must match exactly.
+#   Every file also decodes twice more, with worker threads, to the same result. Then
+#   every file is truncated and mutated, and each variant must decode or fail with an
+#   error, never trap.
+#
+#==============================================================================================
+
+import c
+import files
+import memory
+import heic
+import png
+import compress
+from raster import Raster
+
+## A 64-bit LCG for deterministic mutations.
+struct Random:
+    var state: u64
+
+    mutating func below(bound: usize) -> usize:
+        self.state = self.state *% 6364136223846793005 +% 1442695040888963407
+        return (usize)(self.state >> 33) % bound
+
+## Reads corpus file `name` into heap memory.
+func load(directory: str, name: str) -> u8[]!:
+    var path: u8[1024]
+    let text = try format(path, f"{directory}/{name}")
+    with memory.heap:
+        return try files.read((c.str)text)
+
+## The decoded planes serialised as FFmpeg writes raw video: bytes, or 16-bit little
+## endian above 8 bits; luma, then Cb and Cr.
+func planes_crc(planes: const heic.Planes*) -> u32!:
+    let wide: usize = 2 if planes.bits > 8 else 1
+    let count = planes.luma.length + planes.cb.length + planes.cr.length
+    let bytes = try new u8[count * wide] in memory.heap
+    defer free(bytes) in memory.heap
+    var n: usize = 0
+    for plane in [planes.luma, planes.cb, planes.cr]:
+        for v in plane:
+            bytes[n] = (u8)v
+            if wide == 2:
+                bytes[n + 1] = (u8)(v >> 8)
+            n += wide
+    return (u32)compress.crc32(bytes)
+
+## Fully decodes `data` into `raster` with `threads` threads.
+func decode_raster(data: const u8[], raster: Raster*, threads: usize) -> !:
+    raster.encoded = try new u8[data.length] in memory.heap
+    memory.copy(raster.encoded, data, data.length)
+    try heic.probe(raster)
+    try raster.allocate()
+    try heic.decode(raster, threads = threads)
+
+## Checks an rgb entry: returns the largest difference in 8-bit levels.
+func check_rgb(directory: str, name: str, reference: str, tolerance: usize) -> bool!:
+    let data = try load(directory, name)
+    defer free(data) in memory.heap
+    var image = Raster()
+    defer image.close()
+    try decode_raster(data, &image, 1)
+    var again = Raster()
+    defer again.close()
+    try decode_raster(data, &again, 4)
+    var expected = Raster()
+    defer expected.close()
+    expected.encoded = try load(directory, reference)
+    try png.probe(&expected)
+    try expected.allocate()
+    try png.decode(&expected)
+    if image.width != expected.width or image.height != expected.height or image.channels.length != expected.channels.length:
+        print(f"FAIL {name}: {image.width}x{image.height}x{image.channels.length}, reference {expected.width}x{expected.height}x{expected.channels.length}")
+        return false
+    let scale: f64 = 257.0 if image.bits > 8 else 1.0
+    var worst: f64 = 0.0
+    for i in 0..<image.pixels.length:
+        if image.pixels[i] != again.pixels[i]:
+            print(f"FAIL {name}: threaded decode differs")
+            return false
+        let d = image.pixels[i] - expected.pixels[i]
+        let magnitude = (d if d >= 0.0 else -d) / scale
+        worst = magnitude if magnitude > worst else worst
+    let ok = worst <= (f64)tolerance
+    print(f"{"ok  " if ok else "FAIL"} {name}: {image.width}x{image.height}, largest difference from macOS {worst} (tolerance {tolerance})")
+    return ok
+
+## Checks a planes entry against its CRC32.
+func check_planes(directory: str, name: str, crc: u32) -> bool!:
+    let data = try load(directory, name)
+    defer free(data) in memory.heap
+    var planes: heic.Planes
+    defer planes.close()
+    try heic.decode_planes(data, &planes)
+    var again: heic.Planes
+    defer again.close()
+    try heic.decode_planes(data, &again, threads = 3)
+    let got = try planes_crc(&planes)
+    let ok = got == crc and try planes_crc(&again) == crc
+    print(f"{"ok  " if ok else "FAIL"} {name}: {planes.width}x{planes.height} {planes.bits}-bit, planes CRC {hex(got)}, reference {hex(crc)}")
+    return ok
+
+## Decodes `variants` truncated and mutated copies of `name`; returns how many ran.
+func fuzz(directory: str, name: str, random: Random*, variants: usize) -> usize!:
+    let data = try load(directory, name)
+    defer free(data) in memory.heap
+    let copy = try new u8[data.length] in memory.heap
+    defer free(copy) in memory.heap
+    let lengths: usize[8] = [0, 7, 16, 40, 200, 999, 3000, 8000]
+    var count: usize = 0
+    for variant in 0..<variants:
+        memory.copy(copy, data, data.length)
+        var size = data.length
+        if variant < 8:
+            size = lengths[variant] if lengths[variant] < data.length else data.length // 2
+        elif variant < 16:
+            size = random.below(data.length)
+        else:
+            for k in 0..<1 + random.below(6):
+                copy[random.below(data.length)] = (u8)random.below(256)
+        var planes: heic.Planes
+        defer planes.close()
+        heic.decode_planes(copy[..<size], &planes, max_bytes = 268435456, max_pixels = 16777216, threads = 2) catch failure:
+            recover ()
+        var image = Raster(max_bytes = 268435456, max_pixels = 16777216)
+        defer image.close()
+        decode_raster(copy[..<size], &image, 1) catch failure:
+            recover ()
+        count += 1
+    return count
+
+## `oracle [corpus directory] [variants per file]`.
+func main(arguments: str[]) -> i32!:
+    let directory = arguments[1] if arguments.length > 1 else "corpus"
+    let variants = (usize)(try number(arguments[2], 10)) if arguments.length > 2 else 60
+    let manifest = try load(directory, "manifest.txt")
+    defer free(manifest) in memory.heap
+    var failures: usize = 0
+    var entries: usize = 0
+    var ran: usize = 0
+    var random = Random(state = 2026)
+    var start: usize = 0
+    while start < manifest.length:
+        var end = start
+        while end < manifest.length and manifest[end] != '\n':
+            end += 1
+        let line = manifest[start..<end]
+        start = end + 1
+        if line.length == 0 or line[0] == '#':
+            continue
+        var fields: str[4]
+        var count: usize = 0
+        var i: usize = 0
+        while i < line.length and count < 4:
+            let first = i
+            while i < line.length and line[i] != ' ':
+                i += 1
+            fields[count] = (str)line[first..<i]
+            count += 1
+            i += 1
+        let ok = check_entry(directory, fields) catch failure:
+            print(f"FAIL {fields[1]}: {failure.message}")
+            recover false
+        failures += 0 if ok else 1
+        entries += 1
+        ran += fuzz(directory, fields[1], &random, variants) catch failure:
+            print(f"FAIL fuzzing {fields[1]}: {failure.message}")
+            failures += 1
+            recover 0
+    print(f"{entries - failures} of {entries} corpus files match their references; {ran} truncated or mutated variants decoded without a trap")
+    return 1 if failures > 0 else 0
+
+func check_entry(directory: str, fields: const str[4]) -> bool!:
+    if fields[0] == "rgb":
+        return try check_rgb(directory, fields[1], fields[2], (usize)(try number(fields[3], 10)))
+    return try check_planes(directory, fields[1], (u32)(try number(fields[2], 16)))
+
+func number(text: str, base: u64) -> u64!:
+    var value: u64 = 0
+    for ch in text.bytes:
+        let digit: u64 = (u64)(ch - '0') if ch >= '0' and ch <= '9' else (u64)(ch - 'a') + 10 if ch >= 'a' and ch <= 'f' else 99
+        if digit >= base:
+            error(heic_test_error, "bad number in the manifest")
+        value = value * base + digit
+    return value
+
+let heic_test_error: ErrorCode = ErrorCode.package(1)

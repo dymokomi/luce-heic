@@ -1,0 +1,25 @@
+#prisma 4.0
+def package "luce-heic" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "package"
+    str language = "luce-base"
+    str description = "A HEIC/HEIF still-image decoder for Luce/Base: the HEIF container, grids, alpha and an intra HEVC decoder."
+    str readme = "README.md"
+
+    def dependency "luce-raster" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-raster"
+    }
+
+    def export "heic" {
+        str module = "luce_heic.heic"
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-std"
+    }
+}

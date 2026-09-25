@@ -1,0 +1,61 @@
+#==============================================================================================
+#
+#   heic/parallel - Running independent tasks on worker threads
+#
+#   Workers take task indices from a shared counter until the tasks run out or one fails;
+#   the first failure is kept and returned. Tasks write disjoint memory (grid tiles, bands
+#   of output rows), so they share nothing else.
+#
+#==============================================================================================
+
+## The most threads a decode uses.
+let max_threads: usize = 64
+
+## Tasks shared by the workers.
+struct Pool:
+    var task: func(void*, usize) -> unit!
+    var context: void*
+    var count: usize
+    var next: @usize
+    var failed: @bool
+    var code: ErrorCode
+    var message: str
+
+## A worker: runs tasks until none are left or one has failed.
+func work(raw: void*?):
+    let pool = (Pool*)(raw else return)
+    while not pool.failed.load(.acquire):
+        let index = pool.next.add(1, .relaxed)
+        if index >= pool.count:
+            return
+        pool.task(pool.context, index) catch failure:
+            let (won, seen) = pool.failed.cas(false, true, .acq_rel, .acquire)
+            if won:
+                pool.code = failure.code
+                pool.message = failure.message
+            return
+
+## Runs `task(context, i)` for every i below `count` on up to `threads` threads, the
+## calling thread included, and returns the first failure.
+func run_tasks(count: usize, threads: usize, task: func(void*, usize) -> unit!, context: void*) -> !:
+    let n = min_usize(min_usize(threads, count), max_threads)
+    if n <= 1:
+        for i in 0..<count:
+            try task(context, i)
+        return
+    var pool = Pool(task = task, context = context, count = count, code = corrupt, message = "")
+    var handles: thread.Handle[64]
+    var started: usize = 0
+    for i in 1..<n:
+        handles[started] = thread.spawn(work, (void*)&pool, name = "luce-heic") catch failure:
+            break
+        started += 1
+    work((void*)&pool)
+    for i in 0..<started:
+        handles[i].join() catch failure:
+            pool.failed.store(true, .release)
+    if pool.failed.load(.acquire):
+        error(pool.code, pool.message if pool.message.length > 0 else "HEIC worker thread failed")
+
+func min_usize(a: usize, b: usize) -> usize:
+    return a if a < b else b

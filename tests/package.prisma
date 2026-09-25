@@ -1,0 +1,19 @@
+#prisma 4.0
+def package "luce_heic_tests" {
+    str source = "."
+    def dependency "luce-heic" {
+        str path = ".."
+    }
+    def dependency "luce-png" {
+        str path = "../../luce-png"
+    }
+    def dependency "luce-compress" {
+        str path = "../../luce-compress"
+    }
+    def dependency "luce-raster" {
+        str path = "../../luce-raster"
+    }
+    def dependency "luce-std" {
+        str path = "../../luce-std"
+    }
+}

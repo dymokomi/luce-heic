@@ -1,0 +1,231 @@
+#==============================================================================================
+#
+#   heic/color - YCbCr to RGB, chroma upsampling, and the clean aperture, rotation and
+#   mirroring of the output
+#
+#   Chroma is upsampled as macOS ImageIO does, the reference this decoder is tested
+#   against. For 8-bit images chroma samples sit on the even luma samples and odd positions
+#   average their two neighbours with integer truncation; deeper images interpolate
+#   bilinearly with chroma centred between luma samples, weighting the nearer chroma
+#   sample 3/4 on each axis. Neither crosses a grid tile edge or reaches outside the clean
+#   aperture. An output with an odd width or height, or under 16 pixels on a side, instead
+#   repeats each chroma sample over its 2x2 luma block. The matrix and
+#   range follow ISO/IEC 23091-2 (Kr and Kb per MatrixCoefficients). Output samples are
+#   rounded to 8 bits, or to 16 bits for deeper images.
+#
+#==============================================================================================
+
+## sx = a·x + b·y + e and sy = c·x + d·y + f: output to decoded-image coordinates.
+struct Mapping:
+    var a: i64
+    var b: i64
+    var c: i64
+    var d: i64
+    var e: i64
+    var f: i64
+
+## The mapping from output pixels to decoded pixels that undoes the transforms.
+func mapping(layout: const Layout*) -> Mapping:
+    # Stage sizes: sizes[k] is the size before transform k, sizes[count] the output size.
+    var widths: usize[5]
+    var heights: usize[5]
+    widths[0] = layout.coded_width
+    heights[0] = layout.coded_height
+    for k in 0..<layout.transform_count:
+        let t = layout.transforms[k]
+        let turned = t.kind == box_irot and (t.value & 1) == 1
+        widths[k + 1] = t.width if t.kind == box_clap else heights[k] if turned else widths[k]
+        heights[k + 1] = t.height if t.kind == box_clap else widths[k] if turned else heights[k]
+    var m = Mapping(a = 1, d = 1)
+    var k = layout.transform_count
+    while k > 0:
+        k -= 1
+        let op = layout.transforms[k]
+        let w = (i64)widths[k]
+        let h = (i64)heights[k]
+        # (u, v) = (p·x + q·y + r, s·x + t·y + o) in the stage's input from its output (x, y).
+        var p: i64 = 1
+        var q: i64 = 0
+        var r: i64 = 0
+        var s: i64 = 0
+        var t: i64 = 1
+        var o: i64 = 0
+        if op.kind == box_clap:
+            r = (i64)op.left
+            o = (i64)op.top
+        elif op.kind == box_imir:
+            if op.value == 1:
+                p = -1
+                r = w - 1
+            else:
+                t = -1
+                o = h - 1
+        elif op.value == 1:
+            p = 0
+            q = -1
+            r = w - 1
+            s = 1
+            t = 0
+        elif op.value == 2:
+            p = -1
+            r = w - 1
+            t = -1
+            o = h - 1
+        elif op.value == 3:
+            p = 0
+            q = 1
+            s = -1
+            t = 0
+            o = h - 1
+        m = Mapping(a = p * m.a + q * m.c, b = p * m.b + q * m.d, c = s * m.a + t * m.c, d = s * m.b + t * m.d, e = p * m.e + q * m.f + r, f = s * m.e + t * m.f + o)
+    return m
+
+## How chroma is upsampled: the plane size, the window of luma samples the output shows
+## (the clean aperture, or the whole image) and the grid tile size, which interpolation
+## does not cross, and `repeat` for plain replication or `centred` for the bilinear filter
+## of deeper images.
+struct Upsampling:
+    var cw: usize
+    var ch: usize
+    var left: usize
+    var top: usize
+    var right: usize
+    var bottom: usize
+    var tile_w: usize
+    var tile_h: usize
+    var repeat: bool
+    var centred: bool
+
+## The chroma index paired with `c`, the chroma sample of luma position `i`: the next
+## one for odd positions, the previous one for even positions when `both`, never outside
+## the plane or the window [`low`, `high`) or across a grid tile edge.
+func partner(i: usize, c: usize, count: usize, low: usize, high: usize, tile: usize, both: bool) -> usize:
+    if (i & 1) == 1:
+        return c + 1 if c + 1 < count and i + 1 < high and (tile == 0 or (i + 1) % tile != 0) else c
+    return c - 1 if both and c > 0 and i > low and (tile == 0 or i % tile != 0) else c
+
+## The four chroma sample indices that luma position (x, y) interpolates: the nearest,
+## its horizontal and vertical partners, and the diagonal one.
+struct Sites:
+    var near: usize
+    var across: usize
+    var down: usize
+    var diagonal: usize
+
+func sites(u: const Upsampling*, x: usize, y: usize) -> Sites:
+    let x0 = x >> 1
+    let y0 = y >> 1
+    if u.repeat:
+        let i = y0 * u.cw + x0
+        return Sites(i, i, i, i)
+    let x1 = partner(x, x0, u.cw, u.left, u.right, u.tile_w, u.centred)
+    let y1 = partner(y, y0, u.ch, u.top, u.bottom, u.tile_h, u.centred)
+    return Sites(y0 * u.cw + x0, y0 * u.cw + x1, y1 * u.cw + x0, y1 * u.cw + x1)
+
+## The upsampled chroma value of `plane` at `at`.
+func mix(plane: const u16[], at: const Sites*, centred: bool) -> f64:
+    let a = (i32)plane[at.near]
+    let b = (i32)plane[at.across]
+    let c = (i32)plane[at.down]
+    let d = (i32)plane[at.diagonal]
+    if centred:
+        return 0.75 * (0.75 * (f64)a + 0.25 * (f64)b) + 0.25 * (0.75 * (f64)c + 0.25 * (f64)d)
+    return (f64)((((a + b) >> 1) + ((c + d) >> 1)) >> 1)
+
+## Everything the conversion of one band of output rows needs.
+struct Conversion:
+    var planes: const Planes*
+    var width: usize
+    var height: usize
+    var pixels: f64[]
+    var map: Mapping
+    var upsampling: Upsampling
+    var channels: usize
+    ## Y' = (Y - y_offset) * y_gain and C' = (C - half) * c_gain.
+    var y_offset: f64
+    var y_gain: f64
+    var half: f64
+    var c_gain: f64
+    ## R = Y' + red_cr·Cr', G = Y' + green_cb·Cb' + green_cr·Cr', B = Y' + blue_cb·Cb'.
+    var red_cr: f64
+    var green_cb: f64
+    var green_cr: f64
+    var blue_cb: f64
+    var identity: bool
+    var alpha_gain: f64
+    var out: f64
+
+## Rows per conversion task.
+let band_rows: usize = 32
+
+## Converts `planes` to the interleaved output `pixels` (R, G, B[, A] or Y[, A]) on up
+## to `threads` threads.
+func convert(planes: const Planes*, layout: const Layout*, pixels: f64[], threads: usize) -> !:
+    let top = (f64)((1 << planes.bits) - 1)
+    let step = (f64)(1 << (planes.bits - 8))
+    let matrix = planes.matrix
+    let kr = 0.2126 if matrix == 1 else 0.3 if matrix == 4 else 0.212 if matrix == 7 else 0.2627 if matrix == 9 or matrix == 10 else 0.299
+    let kb = 0.0722 if matrix == 1 else 0.11 if matrix == 4 else 0.087 if matrix == 7 else 0.0593 if matrix == 9 or matrix == 10 else 0.114
+    var v = Conversion(planes = planes, width = layout.width, height = layout.height, pixels = pixels, map = mapping(layout))
+    # The decoded samples the output shows: the mapped corners' bounding box.
+    let m = v.map
+    let x_first = m.e + (m.a * (i64)(layout.width - 1) if m.a < 0 else 0) + (m.b * (i64)(layout.height - 1) if m.b < 0 else 0)
+    let y_first = m.f + (m.c * (i64)(layout.width - 1) if m.c < 0 else 0) + (m.d * (i64)(layout.height - 1) if m.d < 0 else 0)
+    let across = layout.width if m.a != 0 else layout.height
+    let down = layout.height if m.d != 0 else layout.width
+    let odd = (layout.width & 1) == 1 or (layout.height & 1) == 1 or layout.width < 16 or layout.height < 16
+    v.upsampling = Upsampling(cw = (planes.width + 1) >> 1, ch = (planes.height + 1) >> 1, left = (usize)x_first, top = (usize)y_first, right = (usize)x_first + across, bottom = (usize)y_first + down, tile_w = planes.tile_width, tile_h = planes.tile_height, repeat = odd, centred = planes.bits > 8)
+    v.channels = (1 if planes.chroma == 0 else 3) + (1 if planes.alpha.length > 0 else 0)
+    if pixels.length != layout.width * layout.height * v.channels:
+        error(invalid, "HEIC output does not match the decoded planes")
+    v.y_offset = 0.0 if planes.full_range else 16.0 * step
+    v.y_gain = 1.0 / (top if planes.full_range else 219.0 * step)
+    v.half = (f64)(1 << (planes.bits - 1))
+    v.c_gain = 1.0 / (top if planes.full_range else 224.0 * step)
+    v.red_cr = 2.0 * (1.0 - kr)
+    v.blue_cb = 2.0 * (1.0 - kb)
+    v.green_cb = -2.0 * (1.0 - kb) * kb / (1.0 - kr - kb)
+    v.green_cr = -2.0 * (1.0 - kr) * kr / (1.0 - kr - kb)
+    v.identity = matrix == 0
+    v.alpha_gain = 1.0 / (f64)((1 << planes.alpha_bits) - 1) if planes.alpha.length > 0 else 0.0
+    v.out = 255.0 if layout.bits == 8 else 65535.0
+    try run_tasks((layout.height + band_rows - 1) // band_rows, threads, convert_band, (void*)&v)
+
+## Converts output rows `band * band_rows` onward.
+func convert_band(raw: void*, band: usize) -> !:
+    let v = (const Conversion*)raw
+    let planes = v.planes
+    let m = v.map
+    let first = band * band_rows
+    let last = first + band_rows if first + band_rows < v.height else v.height
+    for oy in first..<last:
+        for ox in 0..<v.width:
+            let sx = (usize)(m.a * (i64)ox + m.b * (i64)oy + m.e)
+            let sy = (usize)(m.c * (i64)ox + m.d * (i64)oy + m.f)
+            let at = sy * planes.width + sx
+            let target = (oy * v.width + ox) * v.channels
+            let luma = ((f64)planes.luma[at] - v.y_offset) * v.y_gain
+            if planes.chroma == 0:
+                v.pixels[target] = quantize(luma, v.out)
+            else:
+                let s = sites(&v.upsampling, sx, sy)
+                let blue_raw = mix(planes.cb, &s, v.upsampling.centred)
+                let red_raw = mix(planes.cr, &s, v.upsampling.centred)
+                let cb = (blue_raw - v.half) * v.c_gain
+                let cr = (red_raw - v.half) * v.c_gain
+                if v.identity:
+                    # GBR: Cr holds red and Cb blue, coded like luma.
+                    v.pixels[target] = quantize((red_raw - v.y_offset) * v.y_gain, v.out)
+                    v.pixels[target + 1] = quantize(luma, v.out)
+                    v.pixels[target + 2] = quantize((blue_raw - v.y_offset) * v.y_gain, v.out)
+                else:
+                    v.pixels[target] = quantize(luma + v.red_cr * cr, v.out)
+                    v.pixels[target + 1] = quantize(luma + v.green_cb * cb + v.green_cr * cr, v.out)
+                    v.pixels[target + 2] = quantize(luma + v.blue_cb * cb, v.out)
+            if planes.alpha.length > 0:
+                v.pixels[target + v.channels - 1] = quantize((f64)planes.alpha[at] * v.alpha_gain, v.out)
+
+## A normalised value as an output integer level, rounded half up.
+func quantize(value: f64, out: f64) -> f64:
+    let clamped = 0.0 if not (value > 0.0) else 1.0 if value > 1.0 else value
+    return (f64)(i64)(clamped * out + 0.5)

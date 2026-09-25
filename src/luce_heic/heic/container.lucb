@@ -1,0 +1,363 @@
+#==============================================================================================
+#
+#   heic/container - The HEIF container: ISO BMFF boxes, items, properties and references
+#
+#   The meta box lists items (iinf), where their bytes are (iloc, idat), which properties
+#   each has (iprp: ipco and ipma) and how items refer to each other (iref: dimg for grid
+#   tiles, auxl for auxiliary images). Everything here only indexes the file; item bytes are
+#   copied out on demand.
+#
+#==============================================================================================
+
+let box_ftyp: u32 = 0x66747970
+let box_meta: u32 = 0x6d657461
+let box_hdlr: u32 = 0x68646c72
+let box_pitm: u32 = 0x7069746d
+let box_iinf: u32 = 0x69696e66
+let box_infe: u32 = 0x696e6665
+let box_iloc: u32 = 0x696c6f63
+let box_iprp: u32 = 0x69707270
+let box_ipco: u32 = 0x6970636f
+let box_ipma: u32 = 0x69706d61
+let box_iref: u32 = 0x69726566
+let box_idat: u32 = 0x69646174
+let box_hvcc: u32 = 0x68766343
+let box_ispe: u32 = 0x69737065
+let box_colr: u32 = 0x636f6c72
+let box_irot: u32 = 0x69726f74
+let box_imir: u32 = 0x696d6972
+let box_pixi: u32 = 0x70697869
+let box_auxc: u32 = 0x61757843
+let box_clap: u32 = 0x636c6170
+let ref_dimg: u32 = 0x64696d67
+let ref_auxl: u32 = 0x6175786c
+let item_hvc1: u32 = 0x68766331
+let item_grid: u32 = 0x67726964
+let colr_nclx: u32 = 0x6e636c78
+let colr_prof: u32 = 0x70726f66
+let colr_ricc: u32 = 0x72494343
+let handler_pict: u32 = 0x70696374
+
+## Properties this decoder understands; any other property marked essential is refused.
+let known_properties: u32[13] = [0x68766343, 0x69737065, 0x636f6c72, 0x69726f74, 0x696d6972, 0x70697869, 0x61757843, 0x636c6170, 0x70617370, 0x636c6c69, 0x6d646376, 0x6c73656c, 0x726c6f63]
+
+## The largest item, property and reference counts accepted, to bound allocation.
+let max_items: usize = 16384
+let max_extents: usize = 1048576
+let max_associations: usize = 32
+
+## The big-endian 32-bit value at `position`; the caller checks the bounds.
+func read32(data: const u8[], position: usize) -> u32:
+    return ((u32)data[position] << 24) | ((u32)data[position + 1] << 16) | ((u32)data[position + 2] << 8) | (u32)data[position + 3]
+
+## Brands naming HEVC-coded HEIF or the generic HEIF image brands.
+func is_brand(brand: u32) -> bool:
+    return brand == 0x68656963 or brand == 0x68656978 or brand == 0x6865696d or brand == 0x68656973 or brand == 0x68657663 or brand == 0x68657678 or brand == 0x6d696631 or brand == 0x6d736631
+
+## One box: its four-character code and the byte range of its body.
+struct Box:
+    var kind: u32
+    var body: usize
+    var end: usize
+
+    ## A big-endian reader over the body, after `skip` bytes (4 for a FullBox header).
+    func reader(data: const u8[], skip: usize = 0) -> Reader!:
+        if self.end - self.body < skip:
+            error(corrupt, "HEIF box is shorter than its header")
+        return Reader(data = data[self.body + skip..<self.end], little = false)
+
+## The box starting at `position`, which must end by `end`.
+func read_box(data: const u8[], position: usize, end: usize) -> Box!:
+    if end - position < 8:
+        error(corrupt, "truncated HEIF box header")
+    var size = (u64)read32(data, position)
+    let kind = read32(data, position + 4)
+    var body = position + 8
+    if size == 1:
+        if end - position < 16:
+            error(corrupt, "truncated HEIF box header")
+        size = ((u64)read32(data, position + 8) << 32) | (u64)read32(data, position + 12)
+        body = position + 16
+    elif size == 0:
+        size = (u64)(end - position)
+    if size < (u64)(body - position) or size > (u64)(end - position):
+        error(corrupt, "HEIF box size is out of range")
+    return Box(kind, body, position + (usize)size)
+
+## A byte range of an item: a file offset, or an idat offset for construction method 1.
+struct Extent:
+    var offset: u64
+    var length: u64
+
+## An item from iinf with its location, properties and references.
+struct Item:
+    var id: u32
+    var kind: u32
+    var located: bool
+    var method: u32
+    var base: u64
+    var first_extent: usize
+    var extent_count: usize
+    ## ipco indices (1-based) in association order; bit 15 marks an essential property.
+    var properties: u16[32]
+    var property_count: usize
+    ## The dimg references of a grid: `tile_count` item IDs from `Heif.tiles[first_tile]`.
+    var first_tile: usize
+    var tile_count: usize
+    ## The item an auxl reference says this item is auxiliary to; 0 for none.
+    var auxiliary_of: u32
+
+## The indexed container. `data` is borrowed from the caller for the Heif's lifetime.
+struct Heif:
+    var data: const u8[]
+    var items: Item[]
+    var properties: Box[]
+    var extents: Extent[]
+    var tiles: u32[]
+    var tile_count: usize
+    var idat: Box
+    var primary: u32
+
+    mutating func close():
+        with memory.heap:
+            if self.items.length > 0:
+                free(self.items)
+            if self.properties.length > 0:
+                free(self.properties)
+            if self.extents.length > 0:
+                free(self.extents)
+            if self.tiles.length > 0:
+                free(self.tiles)
+        self = Heif()
+
+    ## The index of item `id` in `items`.
+    func find(id: u32) -> usize!:
+        for i in 0..<self.items.length:
+            if self.items[i].id == id:
+                return i
+        error(corrupt, "HEIF refers to a missing item")
+
+    ## The first property of `kind` associated with the item, if any.
+    func property(item: const Item*, kind: u32) -> Box?:
+        for i in 0..<item.property_count:
+            let index = (usize)(item.properties[i] & 32767)
+            if index > 0 and index <= self.properties.length and self.properties[index - 1].kind == kind:
+                return self.properties[index - 1]
+        return none
+
+    ## Copies the item's bytes, all extents in order, into `output`.
+    func item_data(item: const Item*, output: Buffer*) -> !:
+        if not item.located:
+            error(corrupt, "HEIF item has no location")
+        for e in item.first_extent..<item.first_extent + item.extent_count:
+            let extent = self.extents[e]
+            if item.method == 0:
+                let offset = item.base +? extent.offset else error(corrupt, "HEIF item offset overflows")
+                let length = extent.length if extent.length > 0 else (u64)self.data.length -| offset
+                try output.put(try slice(self.data, offset, length))
+            elif item.method == 1:
+                if self.idat.kind != box_idat:
+                    error(corrupt, "HEIF item refers to a missing idat box")
+                let area = self.data[self.idat.body..<self.idat.end]
+                let offset = item.base +? extent.offset else error(corrupt, "HEIF item offset overflows")
+                let length = extent.length if extent.length > 0 else (u64)area.length -| offset
+                try output.put(try slice(area, offset, length))
+            else:
+                error(unsupported, "HEIF item construction method 2 is not supported")
+
+## Indexes the HEIF file in `data` into `heif`.
+func parse_heif(data: const u8[], heif: Heif*) -> !:
+    heif.data = data
+    var position: usize = 0
+    var branded = false
+    var meta = Box()
+    while position < data.length:
+        let b = try read_box(data, position, data.length)
+        if position == 0 and b.kind != box_ftyp:
+            error(corrupt, "HEIF file does not start with an ftyp box")
+        if b.kind == box_ftyp:
+            var r = try b.reader(data)
+            while r.position + 4 <= r.data.length:
+                if is_brand((u32)(try r.uint(4))):
+                    branded = true
+        elif b.kind == box_meta and meta.kind == 0:
+            meta = b
+        position = b.end
+    if not branded:
+        error(unsupported, "file is not a HEIC or HEIF image")
+    if meta.kind != box_meta or meta.end - meta.body < 4:
+        error(corrupt, "HEIF file has no meta box")
+    # Children may come in any order; iinf defines the items the others refer to.
+    var children: Box[8]
+    let names: u32[8] = [box_hdlr, box_pitm, box_iinf, box_iloc, box_iprp, box_iref, box_idat, 0]
+    position = meta.body + 4
+    while position < meta.end:
+        let b = try read_box(data, position, meta.end)
+        for i in 0..<(usize)7:
+            if b.kind == names[i] and children[i].kind == 0:
+                children[i] = b
+        position = b.end
+    if children[0].kind != box_hdlr:
+        error(corrupt, "HEIF meta box has no handler")
+    var handler = try children[0].reader(data, 8)
+    if try handler.uint(4) != (u64)handler_pict:
+        error(unsupported, "HEIF meta handler is not pict")
+    if children[1].kind != box_pitm or children[2].kind != box_iinf:
+        error(corrupt, "HEIF meta box lacks pitm or iinf")
+    var pitm = try children[1].reader(data)
+    let pitm_version = try pitm.byte()
+    discard(try pitm.take(3))
+    heif.primary = (u32)(try pitm.uint(2 if pitm_version == 0 else 4))
+    heif.idat = children[6]
+    try parse_iinf(heif, children[2])
+    if children[3].kind == box_iloc:
+        try parse_iloc(heif, children[3])
+    if children[4].kind == box_iprp:
+        try parse_iprp(heif, children[4])
+    if children[5].kind == box_iref:
+        try parse_iref(heif, children[5])
+
+## Items from iinf's infe entries (versions 2 and 3; older entries have no item type).
+func parse_iinf(heif: Heif*, box: Box) -> !:
+    var r = try box.reader(heif.data)
+    let version = try r.byte()
+    discard(try r.take(3))
+    let count = (usize)(try r.uint(2 if version == 0 else 4))
+    if count > max_items or count > box.end - box.body:
+        error(limit, "HEIF has too many items")
+    heif.items = try new Item[count] in memory.heap
+    var position = box.body + r.position
+    for i in 0..<count:
+        let b = try read_box(heif.data, position, box.end)
+        if b.kind != box_infe:
+            error(corrupt, "HEIF iinf holds a box other than infe")
+        var e = try b.reader(heif.data)
+        let v = try e.byte()
+        discard(try e.uint(3))
+        if v >= 2:
+            heif.items[i].id = (u32)(try e.uint(2 if v == 2 else 4))
+            discard(try e.uint(2))
+            heif.items[i].kind = (u32)(try e.uint(4))
+        else:
+            heif.items[i].id = (u32)(try e.uint(2))
+        position = b.end
+
+## Item locations: offset, length, base offset and index sizes of 0, 4 or 8 bytes.
+func parse_iloc(heif: Heif*, box: Box) -> !:
+    var total: usize = 0
+    for pass in 0..<(usize)2:
+        var r = try box.reader(heif.data)
+        let version = try r.byte()
+        discard(try r.take(3))
+        if version > 2:
+            error(unsupported, "unsupported HEIF iloc version")
+        let sizes = try r.uint(2)
+        let offset_size = (usize)(sizes >> 12)
+        let length_size = (usize)((sizes >> 8) & 15)
+        let base_size = (usize)((sizes >> 4) & 15)
+        let index_size = (usize)(sizes & 15) if version > 0 else 0
+        for size in [offset_size, length_size, base_size, index_size]:
+            if size != 0 and size != 4 and size != 8:
+                error(corrupt, "invalid HEIF iloc field size")
+        let count = (usize)(try r.uint(2 if version < 2 else 4))
+        var next: usize = 0
+        for i in 0..<count:
+            let id = (u32)(try r.uint(2 if version < 2 else 4))
+            var method: u32 = 0
+            if version > 0:
+                method = (u32)(try r.uint(2)) & 15
+            discard(try r.uint(2))
+            let base = try r.uint(base_size)
+            let extents = (usize)(try r.uint(2))
+            if pass == 1:
+                let item = &heif.items[try heif.find(id)]
+                if item.located:
+                    error(corrupt, "HEIF item is located twice")
+                item.located = true
+                item.method = method
+                item.base = base
+                item.first_extent = next
+                item.extent_count = extents
+            for e in 0..<extents:
+                if index_size > 0:
+                    discard(try r.uint(index_size))
+                let offset = try r.uint(offset_size)
+                let length = try r.uint(length_size)
+                if pass == 1:
+                    heif.extents[next + e] = Extent(offset, length)
+            next += extents
+            if next > max_extents:
+                error(limit, "HEIF has too many item extents")
+        total = next
+        if pass == 0:
+            heif.extents = try new Extent[total] in memory.heap
+
+## Properties (ipco) and their association with items (ipma).
+func parse_iprp(heif: Heif*, box: Box) -> !:
+    var ipco = Box()
+    var position = box.body
+    while position < box.end:
+        let b = try read_box(heif.data, position, box.end)
+        if b.kind == box_ipco and ipco.kind == 0:
+            ipco = b
+        position = b.end
+    if ipco.kind != box_ipco:
+        error(corrupt, "HEIF iprp box has no ipco")
+    var count: usize = 0
+    position = ipco.body
+    while position < ipco.end:
+        position = (try read_box(heif.data, position, ipco.end)).end
+        count += 1
+    heif.properties = try new Box[count] in memory.heap
+    position = ipco.body
+    for i in 0..<count:
+        heif.properties[i] = try read_box(heif.data, position, ipco.end)
+        position = heif.properties[i].end
+    position = box.body
+    while position < box.end:
+        let b = try read_box(heif.data, position, box.end)
+        position = b.end
+        if b.kind != box_ipma:
+            continue
+        var r = try b.reader(heif.data)
+        let version = try r.byte()
+        let flags = try r.uint(3)
+        let entries = (usize)(try r.uint(4))
+        for e in 0..<entries:
+            let item = &heif.items[try heif.find((u32)(try r.uint(2 if version < 1 else 4)))]
+            let associations = (usize)(try r.byte())
+            for a in 0..<associations:
+                var value = (u16)(try r.uint(2 if (flags & 1) != 0 else 1))
+                if (flags & 1) == 0:
+                    value = ((value & 128) << 8) | (value & 127)
+                if item.property_count >= max_associations:
+                    error(unsupported, "HEIF item has too many properties")
+                item.properties[item.property_count] = value
+                item.property_count += 1
+
+## References: dimg (a grid's tiles, in order) and auxl (an auxiliary image's master).
+func parse_iref(heif: Heif*, box: Box) -> !:
+    var r = try box.reader(heif.data)
+    let version = try r.byte()
+    discard(try r.take(3))
+    let width: usize = 2 if version == 0 else 4
+    heif.tiles = try new u32[(box.end - box.body) // 2] in memory.heap
+    var position = box.body + 4
+    while position < box.end:
+        let b = try read_box(heif.data, position, box.end)
+        position = b.end
+        var e = try b.reader(heif.data)
+        let from_id = (u32)(try e.uint(width))
+        let count = (usize)(try e.uint(2))
+        if b.kind == ref_dimg:
+            let item = &heif.items[try heif.find(from_id)]
+            if item.tile_count > 0:
+                error(corrupt, "HEIF item has two dimg references")
+            item.first_tile = heif.tile_count
+            item.tile_count = count
+            for i in 0..<count:
+                heif.tiles[heif.tile_count] = (u32)(try e.uint(width))
+                heif.tile_count += 1
+        elif b.kind == ref_auxl and count > 0:
+            let item = &heif.items[try heif.find(from_id)]
+            item.auxiliary_of = (u32)(try e.uint(width))

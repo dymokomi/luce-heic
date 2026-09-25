@@ -1,0 +1,156 @@
+#==============================================================================================
+#
+#   heic/tests - Unit tests of the parts, and a decode of real files
+#
+#   The corpus gate (tests/oracle.lucb) checks whole files against macOS and FFmpeg; these
+#   tests pin down the pieces: bit reading, CABAC initialisation, scaling lists, the
+#   inverse transforms, intra prediction, the container and the output geometry.
+#
+#==============================================================================================
+
+import files
+
+test "Exp-Golomb codes and emulation prevention":
+    # 1 | 010 | 011 | 00100 | 00101: ue 0, 1, 2, then se +2 and -2.
+    let data: u8[3] = [0b1010_0110, 0b0100_0010, 0b1000_0000]
+    var bits = Bits(data = data)
+    assert(try bits.ue() == 0)
+    assert(try bits.ue() == 1)
+    assert(try bits.ue() == 2)
+    assert(try bits.se() == 2)
+    assert(try bits.se() == -2)
+    let escaped: u8[7] = [0, 0, 3, 1, 0, 0, 3]
+    var plain: u8[7]
+    let n = unescape(escaped, plain)
+    assert(n == 5 and plain[2] == 1 and plain[3] == 0 and plain[4] == 0)
+    let long: u8[5] = [0, 0, 0, 0, 1]
+    var overlong = Bits(data = long)
+    let failed = overlong.ue() catch failure:
+        recover 12345
+    assert(failed == 12345)
+
+test "CABAC contexts start from their initValue and the slice QP":
+    var cabac = Cabac()
+    cabac.reset(26)
+    # 154: slope 0, offset 64: MPS 1 in state 0. 63 at QP 26: state 55, MPS 0, pState 8.
+    assert(cabac.states[ctx_bypass] == 1)
+    assert(cabac.states[ctx_chroma_mode] == 16)
+    # A clipped QP gives the same states as the limit.
+    var low = Cabac()
+    low.reset(-12)
+    var zero = Cabac()
+    zero.reset(0)
+    assert(low.states == zero.states)
+
+test "default scaling lists place Table 7-6 in raster order and upsample it":
+    var s = Scaling()
+    s.defaults()
+    assert(s.factor(2, 0, 3, 3) == 16)
+    assert(s.factor(3, 0, 7, 7) == 115 and s.factor(3, 3, 7, 7) == 91)
+    assert(s.factor(3, 0, 1, 0) == 16 and s.factor(3, 0, 7, 0) == 24)
+    assert(s.factor(4, 1, 15, 15) == 115 and s.factor(4, 1, 0, 0) == 16)
+    assert(s.factor(5, 0, 31, 30) == 115 and s.factor(5, 0, 4, 0) == 16)
+
+test "the 4-point DCT basis is every eighth row of the 32-point one":
+    assert(dct32[0] == 64 and dct32[8 * 32] == 83 and dct32[8 * 32 + 1] == 36 and dct32[24 * 32 + 3] == -36)
+    assert(dct32[31 * 32 + 31] == -4 and dct32[1 * 32] == 90)
+
+test "a DC coefficient transforms to a flat residual":
+    var pic = Picture(width = 32, height = 32, bits = 8, bits_c = 8)
+    let sps = Sps()
+    let pps = Pps()
+    let scaling = Scaling()
+    var c = Ctx(pic = &pic, sps = &sps, pps = &pps, scaling = &scaling)
+    for log2: u32 in 2..=5:
+        let n = (usize)1 << log2
+        for i in 0..<n * n:
+            c.coeffs[i] = 0
+        c.coeffs[0] = 64
+        inverse_transform(&c, log2, false, 0, 0, 12)
+        for i in 1..<n * n:
+            assert(c.coeffs[i] == c.coeffs[0])
+        assert(c.coeffs[0] != 0)
+
+test "intra prediction without neighbours is mid-grey, and DC follows its references":
+    var pic = Picture(width = 16, height = 16, bits = 8, bits_c = 8, units_w = 4, units_h = 4, log2_ctb = 4, ctbs_w = 1, ctbs_h = 1)
+    pic.luma = try new u16[256] in memory.heap
+    defer free(pic.luma) in memory.heap
+    pic.flags = try new u8[16] in memory.heap
+    defer free(pic.flags) in memory.heap
+    var owners: u32[1] = [1]
+    pic.ctb_slice = owners
+    var tiles: u32[1]
+    pic.ctb_tile = tiles
+    var slices: SliceInfo[1]
+    pic.slices = slices
+    let sps = Sps()
+    let pps = Pps()
+    let scaling = Scaling()
+    var c = Ctx(pic = &pic, sps = &sps, pps = &pps, scaling = &scaling)
+    predict(&c, 0, 0, 0, 3, 1)
+    assert(pic.luma[0] == 128 and pic.luma[7 * 16 + 7] == 128)
+    # Mark the top-left 8x8 decoded as 40s; the block right of it predicts DC from the left.
+    for y in 0..<(usize)8:
+        for x in 0..<(usize)8:
+            pic.luma[y * 16 + x] = 40
+    pic.mark(0, 0, 8, unit_decoded)
+    predict(&c, 0, 8, 0, 3, 1)
+    # Left references are 40 (16 of them, the lower 8 substituted), top ones substituted
+    # from the corner: all 40, so the edge filter keeps 40 too.
+    assert(pic.luma[8] == 40 and pic.luma[7 * 16 + 15] == 40)
+
+test "the chroma QP table and clean aperture follow the standard":
+    assert(chroma_qp(29) == 29 and chroma_qp(30) == 29 and chroma_qp(43) == 37 and chroma_qp(44) == 38)
+    # sips crops a 131x77 image from 132x78 with offsets of -1/2.
+    let values: u8[32] = [0, 0, 0, 131, 0, 0, 0, 1, 0, 0, 0, 77, 0, 0, 0, 1, 255, 255, 255, 255, 0, 0, 0, 2, 255, 255, 255, 255, 0, 0, 0, 2]
+    var r = Reader(data = values, little = false)
+    var t = Transform()
+    try clean_aperture(&r, 132, 78, &t)
+    assert(t.left == 0 and t.top == 0 and t.width == 131 and t.height == 77)
+
+test "rotation and mirroring map output pixels back to decoded ones":
+    var layout = Layout(coded_width = 4, coded_height = 2, width = 2, height = 4, transform_count = 1)
+    layout.transforms[0] = Transform(kind = box_irot, value = 1)
+    var m = mapping(&layout)
+    # A quarter turn anticlockwise: output (0, 0) shows decoded (3, 0).
+    assert(m.a * 0 + m.b * 0 + m.e == 3 and m.c * 0 + m.d * 0 + m.f == 0)
+    assert(m.a * 1 + m.b * 3 + m.e == 0 and m.c * 1 + m.d * 3 + m.f == 1)
+    layout = Layout(coded_width = 4, coded_height = 2, width = 4, height = 2, transform_count = 1)
+    layout.transforms[0] = Transform(kind = box_imir, value = 1)
+    m = mapping(&layout)
+    assert(m.a * 0 + m.e == 3 and m.d * 1 + m.f == 1)
+
+test "the container refuses what is not HEIF":
+    assert(not is_heic(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"))
+    assert(is_heic(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"))
+    assert(not is_heic(b"\0\0\0\x18ftypavif\0\0\0\0mif2avif"))
+    var missing = false
+    var heif: Heif
+    defer heif.close()
+    parse_heif(b"\0\0\0\x10ftypheic\0\0\0\0", &heif) catch failure:
+        missing = failure.code == corrupt
+        recover ()
+    assert(missing)
+    var empty = false
+    var broken: Heif
+    defer broken.close()
+    parse_heif(b"\0\0\0\x10ftypheic\0\0\0\0\0\0\0\x08meta", &broken) catch failure:
+        empty = true
+        recover ()
+    assert(empty)
+
+test "a HEIC from macOS decodes: size, channels and sample range":
+    var image = Raster()
+    defer image.close()
+    with memory.heap:
+        image.encoded = try files.read("tests/corpus/sips_214x130.heic")
+    try probe(&image)
+    assert(image.width == 214 and image.height == 130 and image.channels.length == 3 and image.file_format == "HEIC")
+    try image.allocate()
+    try decode(&image)
+    var low: f64 = 255.0
+    var high: f64 = 0.0
+    for v in image.pixels:
+        low = v if v < low else low
+        high = v if v > high else high
+    assert(low >= 0.0 and high <= 255.0 and high - low > 100.0)

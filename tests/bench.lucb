@@ -1,0 +1,53 @@
+#==============================================================================================
+#
+#   bench - Times decoding a HEIC file: `bench file.heic [threads]`
+#
+#   Prints the best of three runs of decode_planes (container and HEVC, grid tiles on the
+#   given threads) and of the full decode to RGB(A) samples.
+#
+#==============================================================================================
+
+import c
+import files
+import memory
+import time
+import heic
+from raster import Raster
+
+func main(arguments: c.str[]) -> i32!:
+    if arguments.length < 2:
+        print("usage: bench file.heic [threads]")
+        return 2
+    var threads: usize = 1
+    if arguments.length > 2:
+        threads = 0
+        for ch in (try str(arguments[2])).bytes:
+            threads = threads * 10 + (usize)(ch - '0')
+    var raster = Raster()
+    defer raster.close()
+    with memory.heap:
+        raster.encoded = try files.read(arguments[1])
+    var best_planes: u64 = ~(u64)0
+    var best_full: u64 = ~(u64)0
+    var width: usize = 0
+    var height: usize = 0
+    for round in 0..<(usize)3:
+        let start = time.now()
+        var planes: heic.Planes
+        defer planes.close()
+        try heic.decode_planes(raster.encoded, &planes, threads = threads)
+        let middle = time.now()
+        var image = Raster()
+        defer image.close()
+        image.encoded = try new u8[raster.encoded.length] in memory.heap
+        memory.copy(image.encoded, raster.encoded, raster.encoded.length)
+        try heic.probe(&image)
+        try image.allocate()
+        try heic.decode(&image, threads = threads)
+        let end = time.now()
+        best_planes = middle - start if middle - start < best_planes else best_planes
+        best_full = end - middle if end - middle < best_full else best_full
+        width = image.width
+        height = image.height
+    print(f"{width}x{height}, {threads} threads: planes {best_planes // 1000000} ms, decode to samples {best_full // 1000000} ms")
+    return 0

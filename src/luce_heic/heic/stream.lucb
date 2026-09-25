@@ -1,0 +1,180 @@
+#==============================================================================================
+#
+#   heic/stream - Decoding an image item's HEVC stream into one picture
+#
+#   The hvcC configuration supplies the parameter sets and the NAL length size; the item
+#   data holds the slice segments of one picture. Slice segments are decoded CTB by CTB in
+#   tile scan, with CABAC restarting at each tile and wavefront row (9.3.1), then the
+#   picture is deblocked and SAO is applied. Pictures after the first are ignored.
+#
+#==============================================================================================
+
+## Parameter sets of one stream.
+struct Decoder:
+    var sps: Sps[16]
+    var pps: Pps[64]
+    var defaults: Scaling
+
+## Decodes the picture coded by `config` (an hvcC body) and `data` (an item's NAL units).
+func decode_picture(config: const u8[], data: const u8[], pic: Picture*, max_bytes: usize, max_pixels: usize) -> !:
+    let d = try new Decoder in memory.heap
+    defer free(d) in memory.heap
+    d.defaults.defaults()
+    var hvcc = try Config.open(config)
+    while let nal = try hvcc.next():
+        try parameter_set(d, nal)
+    var nals = Nals(data = data, size = hvcc.length_size)
+    var c: Ctx*? = none
+    defer free_ctx(c)
+    var previous = SliceHeader()
+    while let nal = try nals.next():
+        let kind = nal_type(nal)
+        let layer = (((u32)nal[0] & 1) << 5) | ((u32)nal[1] >> 3)
+        if kind >= 22 and kind <= 31:
+            error(unsupported, "reserved HEVC VCL NAL unit type")
+        if layer != 0 or kind > 34:
+            continue
+        if kind >= 32:
+            if c == none:
+                try parameter_set(d, nal)
+            continue
+        let rbsp = try alloc u8[nal.length] in memory.heap
+        defer free(rbsp) in memory.heap
+        let length = unescape(nal[2..], rbsp)
+        var bits = Bits(data = rbsp[..<length])
+        let first = length > 0 and (rbsp[0] & 128) != 0
+        if c == none and not first:
+            error(corrupt, "HEVC picture does not start with its first slice segment")
+        if c != none and first:
+            break
+        let h = try parse_slice_header(&bits, kind, d.sps, d.pps, &previous)
+        if not h.dependent:
+            previous = h
+        if c == none:
+            c = try start_picture(d, &h, pic, max_bytes, max_pixels)
+        let ctx = c else error(corrupt, "HEVC picture has no decoding context")
+        if &d.pps[(usize)h.pps] != ctx.pps:
+            error(unsupported, "HEVC slices of one picture use different PPSs")
+        try decode_segment(ctx, rbsp[..<length], h)
+    if c == none:
+        error(corrupt, "HEVC image item has no picture")
+    for owner in pic.ctb_slice:
+        if owner == 0:
+            error(corrupt, "HEVC picture is missing slices")
+    deblock(pic)
+    try apply_sao(pic)
+
+func free_ctx(c: Ctx*?):
+    if let ctx = c:
+        free(ctx) in memory.heap
+
+## Parses a VPS, SPS or PPS NAL unit (VPS is not needed).
+func parameter_set(d: Decoder*, nal: const u8[]) -> !:
+    let kind = nal_type(nal)
+    if kind != nal_sps and kind != nal_pps:
+        return
+    let rbsp = try alloc u8[nal.length] in memory.heap
+    defer free(rbsp) in memory.heap
+    var bits = Bits(data = rbsp[..<unescape(nal[2..], rbsp)])
+    if kind == nal_sps:
+        try parse_sps(&bits, d.sps)
+    else:
+        try parse_pps(&bits, d.pps)
+
+## Activates the first slice's parameter sets and allocates the picture and its context.
+func start_picture(d: Decoder*, h: const SliceHeader*, pic: Picture*, max_bytes: usize, max_pixels: usize) -> Ctx*!:
+    let pps = &d.pps[(usize)h.pps]
+    let sps = &d.sps[(usize)pps.sps]
+    if sps.width * sps.height > max_pixels:
+        error(limit, "HEVC picture exceeds the pixel limit")
+    if pps.qp_delta_depth > sps.log2_ctb - sps.log2_min_cb:
+        error(corrupt, "HEVC cu_qp_delta depth exceeds the coding tree")
+    if pps.init_qp < -6 * (i32)(sps.bits - 8):
+        error(corrupt, "HEVC initial QP is out of range")
+    try allocate_picture(pic, sps, pps, max_bytes)
+    let scaling = &d.defaults if not sps.scaling_enabled else &pps.scaling if pps.scaling_present else &sps.scaling
+    let c = try new Ctx(pic = pic, sps = sps, pps = pps, scaling = scaling) in memory.heap
+    c.qg_log2 = sps.log2_ctb - pps.qp_delta_depth
+    return c
+
+## The first CTB column of the tile holding CTB `rs`.
+func tile_column_start(pic: const Picture*, rs: usize) -> usize:
+    return pic.column_starts[(usize)pic.ctb_tile[rs] % pic.tile_columns]
+
+## Whether CTB `rs` is the first CTB of its tile.
+func tile_start(pic: const Picture*, rs: usize) -> bool:
+    let tile = (usize)pic.ctb_tile[rs]
+    return rs % pic.ctbs_w == pic.column_starts[tile % pic.tile_columns] and rs // pic.ctbs_w == pic.row_starts[tile // pic.tile_columns]
+
+## Wavefront synchronisation at the start of CTB row `rs` (9.3.2.4): the contexts saved
+## after the CTB above and to the right, if it is available, else a fresh start.
+func wpp_start(c: Ctx*, rs: usize):
+    let pic = c.pic
+    let w = pic.ctbs_w
+    if rs >= w and rs % w + 1 < w:
+        let other = rs - w + 1
+        let owner = pic.ctb_slice[other]
+        if owner != 0 and pic.slices[(usize)owner - 1].address == c.slice_addr and pic.ctb_tile[other] == pic.ctb_tile[rs]:
+            c.cabac.states = c.wpp_states
+            return
+    c.cabac.reset(c.h.qp)
+
+## Decodes one slice segment whose RBSP is `data`.
+func decode_segment(c: Ctx*, data: const u8[], h: SliceHeader) -> !:
+    let pic = c.pic
+    let w = pic.ctbs_w
+    let ctbs = w * pic.ctbs_h
+    c.h = h
+    c.cabac.data = data
+    if not h.dependent:
+        c.slice_addr = h.address
+    if pic.slice_count >= pic.slices.length:
+        error(corrupt, "HEVC picture has too many slice segments")
+    pic.slices[pic.slice_count] = SliceInfo(address = c.slice_addr, deblock_disabled = h.deblock_disabled, beta_offset = h.beta_offset, tc_offset = h.tc_offset, across_slices = h.across_slices)
+    pic.slice_count += 1
+    c.slice = (u32)pic.slice_count
+    c.cabac.start(h.data)
+    var rs = h.address
+    if tile_start(pic, rs):
+        c.cabac.reset(h.qp)
+    elif c.pps.wpp and rs % w == tile_column_start(pic, rs):
+        wpp_start(c, rs)
+    elif h.dependent:
+        c.cabac.states = c.ds_states
+    else:
+        c.cabac.reset(h.qp)
+    if not h.dependent or tile_start(pic, rs) or (c.pps.wpp and rs % w == tile_column_start(pic, rs)):
+        c.first_qg = true
+    var ts = (usize)pic.rs_to_ts[rs]
+    while true:
+        rs = (usize)pic.ts_to_rs[ts]
+        if pic.ctb_slice[rs] != 0:
+            error(corrupt, "HEVC slice segments overlap")
+        pic.ctb_slice[rs] = c.slice
+        c.tile = pic.ctb_tile[rs]
+        c.ctb_x = (rs % w) << pic.log2_ctb
+        c.ctb_y = (rs // w) << pic.log2_ctb
+        if c.h.sao_luma or c.h.sao_chroma:
+            try parse_sao(c, rs)
+        try coding_quadtree(c, c.ctb_x, c.ctb_y, pic.log2_ctb, 0)
+        let end = c.cabac.terminate() == 1
+        if c.pps.wpp and rs % w == tile_column_start(pic, rs) + 1:
+            c.wpp_states = c.cabac.states
+        ts += 1
+        if end:
+            c.ds_states = c.cabac.states
+            return
+        if ts >= ctbs:
+            error(corrupt, "HEVC slice segment runs past the picture")
+        let next = (usize)pic.ts_to_rs[ts]
+        let new_tile = pic.ctb_tile[next] != pic.ctb_tile[rs]
+        let new_row = c.pps.wpp and next % w == tile_column_start(pic, next)
+        if new_tile or new_row:
+            if c.cabac.terminate() != 1:
+                error(corrupt, "HEVC substream does not end where it should")
+            c.cabac.start(c.cabac.position)
+            c.first_qg = true
+            if new_tile:
+                c.cabac.reset(c.h.qp)
+            else:
+                wpp_start(c, next)

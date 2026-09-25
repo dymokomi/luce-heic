@@ -1,0 +1,204 @@
+#==============================================================================================
+#
+#   heic/residual - residual_coding() (7.3.8.11): the last significant position, coded
+#   sub-block flags, significance maps, greater-than-1/2 flags, signs with sign data hiding,
+#   and Rice-coded remaining levels, then reconstruction of the block.
+#
+#==============================================================================================
+
+## Scans of a 4x4 block (x | y << 2): up-right diagonal, horizontal and vertical.
+let scan4: u8[48] = [
+    0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+]
+
+## Scans of a 2x2 grid of sub-blocks (x | y << 1): diagonal, horizontal and vertical.
+let scan2: u8[12] = [0, 2, 1, 3, 0, 1, 2, 3, 0, 2, 1, 3]
+
+## ctxIdxMap for sig_coeff_flag in 4x4 blocks (9-39).
+let sig_map: u8[16] = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8]
+
+## sigCtx before its offsets in larger blocks, by the right and lower neighbours' coded
+## sub-block flags (prevCsbf, 0-3) and the position in the sub-block (9.3.4.2.5).
+let sig_pattern: u8[64] = [2, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+
+## Sub-block `i` of the scan `scan` over a grid of 2^log2 sub-blocks per side, as (x, y).
+func sub_block(log2: u32, scan: usize, i: usize) -> (usize, usize):
+    if log2 == 0:
+        return (0, 0)
+    if log2 == 1:
+        let v = (usize)scan2[scan * 4 + i]
+        return (v & 1, v >> 1)
+    if log2 == 2:
+        let v = (usize)scan4[i]
+        return (v & 3, v >> 2)
+    let v = (usize)diag8[i]
+    return (v & 7, v >> 3)
+
+## Parses the residual of the 2^log2 block of component `component` at (x0, y0) in that
+## component's samples, then dequantises, transforms and adds it to the prediction.
+func residual(c: Ctx*, component: u32, x0: usize, y0: usize, log2: u32) -> !:
+    let n = (usize)1 << log2
+    let cabac = &c.cabac
+    for i in 0..<n * n:
+        c.coeffs[i] = 0
+    let luma = component == 0
+    var skip = false
+    if c.pps.transform_skip and not c.bypass and log2 == 2:
+        skip = cabac.decode(ctx_transform_skip + (0 if luma else 1)) == 1
+    # last_sig_coeff_{x,y}_prefix and suffix (9.3.4.2.3).
+    let offset: usize = (usize)(3 * (log2 - 2) + ((log2 - 1) >> 2)) if luma else 15
+    let shift: u32 = (log2 + 1) >> 2 if luma else log2 - 2
+    let top = (log2 << 1) - 1
+    var px: u32 = 0
+    while px < top and cabac.decode(ctx_last_x + offset + (usize)(px >> shift)) == 1:
+        px += 1
+    var py: u32 = 0
+    while py < top and cabac.decode(ctx_last_y + offset + (usize)(py >> shift)) == 1:
+        py += 1
+    var last_x = (usize)px
+    var last_y = (usize)py
+    if px > 3:
+        last_x = ((usize)1 << ((px >> 1) - 1)) * (2 + (usize)(px & 1)) + (usize)cabac.bypass_bits((px >> 1) - 1)
+    if py > 3:
+        last_y = ((usize)1 << ((py >> 1) - 1)) * (2 + (usize)(py & 1)) + (usize)cabac.bypass_bits((py >> 1) - 1)
+    let mode = (u32)c.pic.modes[c.pic.unit_at(x0, y0)] if luma else c.chroma_mode
+    var scan: usize = 0
+    if log2 == 2 or (log2 == 3 and luma):
+        scan = 2 if mode >= 6 and mode <= 14 else 1 if mode >= 22 and mode <= 30 else 0
+    if scan == 2:
+        let swap = last_x
+        last_x = last_y
+        last_y = swap
+    if last_x >= n or last_y >= n:
+        error(corrupt, "HEVC last significant coefficient is outside the block")
+    # Locate the last sub-block and the last position inside it.
+    let sb_log2 = log2 - 2
+    let sb_count = (usize)1 << (sb_log2 * 2)
+    var last_sb: usize = 0
+    for i in 0..<sb_count:
+        let (sx, sy) = sub_block(sb_log2, scan, i)
+        if sx == last_x >> 2 and sy == last_y >> 2:
+            last_sb = i
+    var last_pos: usize = 0
+    for i in 0..<(usize)16:
+        if (usize)scan4[scan * 16 + i] == ((last_y & 3) << 2 | (last_x & 3)):
+            last_pos = i
+    var coded: u8[64]
+    let side = (usize)1 << sb_log2
+    var greater1_ctx: u32 = 1
+    var max_x: usize = 0
+    var max_y: usize = 0
+    var i = last_sb + 1
+    while i > 0:
+        i -= 1
+        let (xs, ys) = sub_block(sb_log2, scan, i)
+        let right = (u32)coded[ys * 8 + xs + 1] if xs + 1 < side else 0
+        let below = (u32)coded[(ys + 1) * 8 + xs] if ys + 1 < side else 0
+        var infer_dc = false
+        if i < last_sb and i > 0:
+            let inc = (1 if right + below > 0 else 0) + (0 if luma else 2)
+            coded[ys * 8 + xs] = (u8)cabac.decode(ctx_csbf + (usize)inc)
+            infer_dc = true
+        else:
+            coded[ys * 8 + xs] = 1
+        if coded[ys * 8 + xs] == 0:
+            continue
+        # Significance, highest scan position first.
+        var positions: u8[16]
+        var count: usize = 0
+        var start: usize = 16
+        if i == last_sb:
+            positions[0] = (u8)last_pos
+            count = 1
+            start = last_pos
+        let previous = (usize)(right | (below << 1))
+        # The context offset shared by the sub-block's coefficients (9-40 to 9-43).
+        var offset_sig: usize = ctx_sig + (0 if luma else 27)
+        if log2 > 2:
+            offset_sig += (3 if luma and (xs > 0 or ys > 0) else 0) + ((9 if scan == 0 else 15) if log2 == 3 else (21 if luma else 12))
+        let dc_sub_block = xs == 0 and ys == 0
+        var nn = start
+        while nn > 0:
+            nn -= 1
+            let p = (usize)scan4[scan * 16 + nn]
+            var significant = false
+            if nn > 0 or not infer_dc:
+                var context: usize = 0
+                if log2 == 2:
+                    context = ctx_sig + (usize)sig_map[p] + (0 if luma else 27)
+                elif dc_sub_block and p == 0:
+                    context = ctx_sig + (0 if luma else 27)
+                else:
+                    context = offset_sig + (usize)sig_pattern[previous * 16 + p]
+                significant = cabac.decode(context) == 1
+                if significant:
+                    infer_dc = false
+            else:
+                significant = true
+            if significant:
+                positions[count] = (u8)nn
+                count += 1
+        if count == 0:
+            continue
+        # Greater-than-1 and greater-than-2 flags (9.3.4.2.6, 9.3.4.2.7).
+        var group: u32 = 0 if i == 0 or not luma else 2
+        if i != last_sb and greater1_ctx == 0:
+            group += 1
+        greater1_ctx = 1
+        var greater1: u8[8]
+        var first_greater1: isize = -1
+        for m in 0..<(count if count < 8 else 8):
+            greater1[m] = (u8)cabac.decode(ctx_gt1 + (usize)(group * 4 + greater1_ctx + (0 if luma else 16)))
+            if greater1[m] == 1:
+                greater1_ctx = 0
+                if first_greater1 < 0:
+                    first_greater1 = (isize)m
+            elif greater1_ctx > 0 and greater1_ctx < 3:
+                greater1_ctx += 1
+        var greater2: u32 = 0
+        if first_greater1 >= 0:
+            greater2 = cabac.decode(ctx_gt2 + (usize)(group + (0 if luma else 4)))
+        let hidden = c.pps.sign_hiding and not c.bypass and (usize)positions[0] - (usize)positions[count - 1] > 3
+        let sign_count = count - (1 if hidden else 0)
+        let signs = cabac.bypass_bits((u32)sign_count) << (32 - (u32)sign_count) if sign_count > 0 else 0
+        var rice: u32 = 0
+        var sum: i64 = 0
+        for m in 0..<count:
+            var value = (i64)1
+            if m < 8:
+                value += (i64)greater1[m]
+                if (isize)m == first_greater1:
+                    value += (i64)greater2
+            let threshold: i64 = (3 if (isize)m == first_greater1 else 2) if m < 8 else 1
+            if value == threshold:
+                value += try remaining(cabac, rice)
+                if value > 3 * ((i64)1 << rice):
+                    rice = rice + 1 if rice < 4 else 4
+            sum += value
+            var negative = m < sign_count and ((signs << (u32)m) & 0x80000000) != 0
+            if hidden and m == count - 1 and (sum & 1) == 1:
+                negative = true
+            let p = (usize)scan4[scan * 16 + (usize)positions[m]]
+            let x = (xs << 2) + (p & 3)
+            let y = (ys << 2) + (p >> 2)
+            let clipped = value if value < 32768 else 32768
+            c.coeffs[y * n + x] = (i32)(-clipped if negative else (clipped if clipped < 32768 else 32767))
+            max_x = x if x > max_x else max_x
+            max_y = y if y > max_y else max_y
+    try reconstruct(c, component, x0, y0, log2, skip, max_x, max_y)
+
+## coeff_abs_level_remaining with Rice parameter `rice` (9.3.3.11).
+func remaining(cabac: Cabac*, rice: u32) -> i64!:
+    var prefix: u32 = 0
+    while cabac.bypass() == 1:
+        prefix += 1
+        if prefix > 32:
+            error(corrupt, "HEVC coefficient level is too long")
+    if prefix < 3:
+        return ((i64)prefix << rice) + (i64)cabac.bypass_bits(rice)
+    let extra = prefix - 3
+    if extra + rice > 31:
+        error(corrupt, "HEVC coefficient level is too large")
+    return ((((i64)1 << extra) + 2) << rice) + (i64)cabac.bypass_bits(extra + rice)

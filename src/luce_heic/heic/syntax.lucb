@@ -1,0 +1,345 @@
+#==============================================================================================
+#
+#   heic/syntax - Coding tree units: SAO syntax, coding quadtrees, coding units and
+#   transform trees (7.3.8), with quantisation parameters (8.6.1) and intra mode derivation
+#   (8.4.2 and 8.4.3). Blocks are predicted and reconstructed as soon as they are parsed.
+#
+#==============================================================================================
+
+## Table 8-10: QpC as a function of qPi for 4:2:0, for qPi 30 to 43.
+let chroma_qp_table: i32[14] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37]
+
+## The chroma modes intra_chroma_pred_mode 0-3 name: planar, vertical, horizontal, DC.
+let chroma_candidates: u32[4] = [0, 26, 10, 1]
+
+## The state of decoding one picture's slice segments.
+struct Ctx:
+    var pic: Picture*
+    var sps: const Sps*
+    var pps: const Pps*
+    var scaling: const Scaling*
+    var h: SliceHeader
+    var cabac: Cabac
+    ## One more than the index in `pic.slices` of the current slice segment.
+    var slice: u32
+    ## SliceAddrRs: the address of the first CTB of the current (independent) slice.
+    var slice_addr: usize
+    var tile: u32
+    var ctb_x: usize
+    var ctb_y: usize
+    var qg_log2: u32
+    var qp_y: i32
+    var qp_prev: i32
+    var qp_pred: i32
+    var qp_delta: i32
+    var qp_delta_coded: bool
+    ## A quantisation group has started and its prediction waits for its first CU.
+    var qg_started: bool
+    var first_qg: bool
+    var qp_cb: i32
+    var qp_cr: i32
+    var bypass: bool
+    var chroma_mode: u32
+    var max_depth: u32
+    var intra_split: bool
+    ## Contexts saved for wavefront rows and for the next dependent slice segment.
+    var wpp_states: u8[137]
+    var ds_states: u8[137]
+    var coeffs: i32[1024]
+    var temp: i32[1024]
+
+    ## Whether luma sample (x, y) is decoded, in the current slice and in the current tile
+    ## (6.4.1).
+    func available(x: usize, y: usize) -> bool:
+        if x >= self.pic.width or y >= self.pic.height:
+            return false
+        if (self.pic.flags[self.pic.unit_at(x, y)] & unit_decoded) == 0:
+            return false
+        if x >= self.ctb_x and y >= self.ctb_y and x - self.ctb_x < (usize)1 << self.pic.log2_ctb:
+            return true
+        let ctb = self.pic.ctb(x, y)
+        return self.pic.slices[(usize)self.pic.ctb_slice[ctb] - 1].address == self.slice_addr and self.pic.ctb_tile[ctb] == self.tile
+
+## qPY_PRED for the quantisation group whose first coding unit is at (x, y) (8.6.1).
+func predict_qp(c: Ctx*, x: usize, y: usize):
+    let previous = c.h.qp if c.first_qg else c.qp_prev
+    c.first_qg = false
+    let a = (i32)c.pic.qps[c.pic.unit_at(x - 1, y)] if x > c.ctb_x else previous
+    let b = (i32)c.pic.qps[c.pic.unit_at(x, y - 1)] if y > c.ctb_y else previous
+    c.qp_pred = (a + b + 1) >> 1
+
+## QpY and the chroma Qp' values from qPY_PRED and CuQpDeltaVal.
+func update_qp(c: Ctx*):
+    let offset = 6 * (i32)(c.sps.bits - 8)
+    let offset_c = 6 * (i32)(c.sps.bits_c - 8)
+    c.qp_y = ((c.qp_pred + c.qp_delta + 52 + 2 * offset) % (52 + offset)) - offset
+    c.qp_cb = chroma_qp(clamp(c.qp_y + c.pps.cb_offset + c.h.cb_offset, -offset_c, 57)) + offset_c
+    c.qp_cr = chroma_qp(clamp(c.qp_y + c.pps.cr_offset + c.h.cr_offset, -offset_c, 57)) + offset_c
+
+func chroma_qp(qpi: i32) -> i32:
+    return qpi if qpi < 30 else qpi - 6 if qpi > 43 else chroma_qp_table[(usize)(qpi - 30)]
+
+func clamp(value: i32, low: i32, high: i32) -> i32:
+    return low if value < low else high if value > high else value
+
+## sao(rx, ry) for the CTB at raster address `rs`.
+func parse_sao(c: Ctx*, rs: usize) -> !:
+    let pic = c.pic
+    let w = pic.ctbs_w
+    if rs % w > 0 and rs > c.slice_addr and pic.ctb_tile[rs] == pic.ctb_tile[rs - 1]:
+        if c.cabac.decode(ctx_sao_merge) == 1:
+            pic.sao[rs] = pic.sao[rs - 1]
+            return
+    if rs >= w and rs - w >= c.slice_addr and pic.ctb_tile[rs] == pic.ctb_tile[rs - w]:
+        if c.cabac.decode(ctx_sao_merge) == 1:
+            pic.sao[rs] = pic.sao[rs - w]
+            return
+    var s = Sao()
+    for component in 0..<(usize)(3 if pic.chroma != 0 else 1):
+        if not (c.h.sao_luma if component == 0 else c.h.sao_chroma):
+            continue
+        if component == 2:
+            s.kind[2] = s.kind[1]
+        elif c.cabac.decode(ctx_sao_type) == 1:
+            s.kind[component] = 1 if c.cabac.bypass() == 0 else 2
+        if s.kind[component] == 0:
+            continue
+        let depth = pic.bits if component == 0 else pic.bits_c
+        let top = ((u32)1 << ((depth if depth < 10 else 10) - 5)) - 1
+        var magnitudes: i16[4]
+        for i in 0..<(usize)4:
+            var v: u32 = 0
+            while v < top and c.cabac.bypass() == 1:
+                v += 1
+            magnitudes[i] = (i16)v
+        for i in 0..<(usize)4:
+            var v = magnitudes[i]
+            if s.kind[component] == 1:
+                if v != 0 and c.cabac.bypass() == 1:
+                    v = -v
+            elif i >= 2:
+                v = -v
+            # log2_sao_offset_scale is 0 without the range extension, so no scaling.
+            s.offsets[component * 4 + i] = v
+        if s.kind[component] == 1:
+            s.detail[component] = (u8)c.cabac.bypass_bits(5)
+        elif component == 2:
+            s.detail[2] = s.detail[1]
+        else:
+            s.detail[component] = (u8)c.cabac.bypass_bits(2)
+    pic.sao[rs] = s
+
+## coding_quadtree(x0, y0, log2CbSize, cqtDepth).
+func coding_quadtree(c: Ctx*, x0: usize, y0: usize, log2: u32, depth: u32) -> !:
+    let pic = c.pic
+    let size = (usize)1 << log2
+    var split = log2 > c.sps.log2_min_cb
+    if x0 + size <= pic.width and y0 + size <= pic.height and log2 > c.sps.log2_min_cb:
+        var inc: usize = 0
+        if x0 > 0 and c.available(x0 - 1, y0) and (u32)pic.depths[pic.unit_at(x0 - 1, y0)] > depth:
+            inc += 1
+        if y0 > 0 and c.available(x0, y0 - 1) and (u32)pic.depths[pic.unit_at(x0, y0 - 1)] > depth:
+            inc += 1
+        split = c.cabac.decode(ctx_split_cu + inc) == 1
+    if log2 >= c.qg_log2:
+        c.qg_started = true
+        c.qp_delta = 0
+        c.qp_delta_coded = false
+    if split:
+        let half = size >> 1
+        try coding_quadtree(c, x0, y0, log2 - 1, depth + 1)
+        if x0 + half < pic.width:
+            try coding_quadtree(c, x0 + half, y0, log2 - 1, depth + 1)
+        if y0 + half < pic.height:
+            try coding_quadtree(c, x0, y0 + half, log2 - 1, depth + 1)
+            if x0 + half < pic.width:
+                try coding_quadtree(c, x0 + half, y0 + half, log2 - 1, depth + 1)
+    else:
+        try coding_unit(c, x0, y0, log2, depth)
+
+## The MPM candidate from the neighbouring luma sample (x, y), DC when unavailable.
+func mpm_candidate(c: const Ctx*, x: usize, y: usize, x0: usize, y0: usize) -> u32:
+    if (x >= x0 and y >= y0) or c.available(x, y):
+        return (u32)c.pic.modes[c.pic.unit_at(x, y)]
+    return 1
+
+## coding_unit(x0, y0, log2CbSize) of an intra slice.
+func coding_unit(c: Ctx*, x0: usize, y0: usize, log2: u32, depth: u32) -> !:
+    let pic = c.pic
+    let sps = c.sps
+    let size = (usize)1 << log2
+    if c.qg_started:
+        predict_qp(c, x0, y0)
+        c.qg_started = false
+    update_qp(c)
+    c.bypass = c.pps.bypass and c.cabac.decode(ctx_bypass) == 1
+    var split = false
+    if log2 == sps.log2_min_cb:
+        split = c.cabac.decode(ctx_part_mode) == 0
+        if split and log2 - 1 < sps.log2_min_tb:
+            error(corrupt, "HEVC NxN partition is smaller than the smallest transform")
+    for uy in (y0 >> 2)..<((y0 + size) >> 2):
+        for ux in (x0 >> 2)..<((x0 + size) >> 2):
+            pic.depths[uy * pic.units_w + ux] = (u8)depth
+    if not split and sps.pcm and log2 >= sps.log2_min_pcm and log2 <= sps.log2_max_pcm and c.cabac.terminate() == 1:
+        try pcm_sample(c, x0, y0, log2)
+        pic.set_mode(x0, y0, size, 1)
+        pic.mark(x0, y0, size, unit_decoded | (unit_unfiltered if pic.pcm_loop_filter_disabled else 0))
+        mark_edges(c, x0, y0, size)
+    else:
+        let parts: usize = 4 if split else 1
+        let pb = size >> 1 if split else size
+        var flags: u32[4]
+        for i in 0..<parts:
+            flags[i] = c.cabac.decode(ctx_prev_intra)
+        var first: u32 = 0
+        for i in 0..<parts:
+            let px = x0 + pb * (i & 1)
+            let py = y0 + pb * (i >> 1)
+            let a = mpm_candidate(c, px - 1, py, x0, y0) if px > 0 else 1
+            let b = mpm_candidate(c, px, py - 1, x0, y0) if py > c.ctb_y else 1
+            var list: u32[3]
+            if a == b:
+                list = [0, 1, 26] if a < 2 else [a, 2 + ((a + 29) % 32), 2 + ((a - 1) % 32)]
+            else:
+                list = [a, b, 0 if a != 0 and b != 0 else 1 if a != 1 and b != 1 else 26]
+            var mode: u32 = 0
+            if flags[i] == 1:
+                let index = 0 if c.cabac.bypass() == 0 else 1 if c.cabac.bypass() == 0 else 2
+                mode = list[index]
+            else:
+                mode = c.cabac.bypass_bits(5)
+                list = sort3(list)
+                for j in 0..<(usize)3:
+                    if mode >= list[j]:
+                        mode += 1
+            pic.set_mode(px, py, pb, (u8)mode)
+            if i == 0:
+                first = mode
+        if pic.chroma != 0:
+            var code: u32 = 4
+            if c.cabac.decode(ctx_chroma_mode) == 1:
+                code = c.cabac.bypass_bits(2)
+            c.chroma_mode = first if code == 4 else 34 if chroma_candidates[code] == first else chroma_candidates[code]
+        c.intra_split = split
+        c.max_depth = sps.depth_intra + (1 if split else 0)
+        try transform_tree(c, x0, y0, x0, y0, log2, 0, 0, false, false)
+    if c.bypass:
+        pic.mark(x0, y0, size, unit_unfiltered)
+    for uy in (y0 >> 2)..<((y0 + size) >> 2):
+        for ux in (x0 >> 2)..<((x0 + size) >> 2):
+            pic.qps[uy * pic.units_w + ux] = (i8)c.qp_y
+    c.qp_prev = c.qp_y
+
+## The three candidate modes sorted ascending.
+func sort3(list: u32[3]) -> u32[3]:
+    var sorted = list
+    for i in 0..<(usize)2:
+        for j in 0..<(usize)(2 - i):
+            if sorted[j] > sorted[j + 1]:
+                let swap = sorted[j]
+                sorted[j] = sorted[j + 1]
+                sorted[j + 1] = swap
+    return sorted
+
+## pcm_sample(): raw samples at the byte after pcm_flag; CABAC restarts after them.
+func pcm_sample(c: Ctx*, x0: usize, y0: usize, log2: u32) -> !:
+    let pic = c.pic
+    var bits = Bits(data = c.cabac.data, position = c.cabac.position * 8)
+    let size = (usize)1 << log2
+    for y in 0..<size:
+        for x in 0..<size:
+            pic.luma[(y0 + y) * pic.width + x0 + x] = (u16)((try bits.bits(c.sps.pcm_bits)) << (pic.bits - c.sps.pcm_bits))
+    if pic.chroma != 0:
+        for plane in [pic.cb, pic.cr]:
+            for y in 0..<size >> 1:
+                for x in 0..<size >> 1:
+                    plane[((y0 >> 1) + y) * pic.cwidth + (x0 >> 1) + x] = (u16)((try bits.bits(c.sps.pcm_bits_c)) << (pic.bits_c - c.sps.pcm_bits_c))
+    c.cabac.start((bits.position + 7) >> 3)
+
+## Marks the left and top edges of the luma block (x, y, size) for deblocking when they lie
+## on the 8x8 grid inside the picture and the slice and tile rules allow it.
+func mark_edges(c: Ctx*, x: usize, y: usize, size: usize):
+    if c.h.deblock_disabled:
+        return
+    let pic = c.pic
+    if x > 0 and (x & 7) == 0 and edge_allowed(c, x - 1, y):
+        for uy in (y >> 2)..<((y + size) >> 2):
+            pic.flags[uy * pic.units_w + (x >> 2)] |= unit_edge_left
+    if y > 0 and (y & 7) == 0 and edge_allowed(c, x, y - 1):
+        for ux in (x >> 2)..<((x + size) >> 2):
+            pic.flags[(y >> 2) * pic.units_w + ux] |= unit_edge_top
+
+## Whether an edge between the current CTB and the one holding (x, y) may be filtered.
+func edge_allowed(c: const Ctx*, x: usize, y: usize) -> bool:
+    let pic = c.pic
+    let other = pic.ctb(x, y)
+    if other == pic.ctb(c.ctb_x, c.ctb_y):
+        return true
+    if pic.ctb_slice[other] == 0 or (pic.ctb_tile[other] != c.tile and not pic.across_tiles):
+        return false
+    return pic.slices[(usize)pic.ctb_slice[other] - 1].address == c.slice_addr or c.h.across_slices
+
+## transform_tree(): `parent_cb` and `parent_cr` are the chroma cbfs one level up.
+func transform_tree(c: Ctx*, x0: usize, y0: usize, xb: usize, yb: usize, log2: u32, depth: u32, block: u32, parent_cb: bool, parent_cr: bool) -> !:
+    let sps = c.sps
+    var split = log2 > sps.log2_max_tb or (c.intra_split and depth == 0)
+    if log2 <= sps.log2_max_tb and log2 > sps.log2_min_tb and depth < c.max_depth and not (c.intra_split and depth == 0):
+        split = c.cabac.decode(ctx_split_tu + 5 - (usize)log2) == 1
+    var cb = parent_cb
+    var cr = parent_cr
+    if log2 > 2 and c.pic.chroma != 0:
+        cb = (depth == 0 or parent_cb) and c.cabac.decode(ctx_cbf_chroma + (usize)depth) == 1
+        cr = (depth == 0 or parent_cr) and c.cabac.decode(ctx_cbf_chroma + (usize)depth) == 1
+    if split:
+        let half = (usize)1 << (log2 - 1)
+        try transform_tree(c, x0, y0, x0, y0, log2 - 1, depth + 1, 0, cb, cr)
+        try transform_tree(c, x0 + half, y0, x0, y0, log2 - 1, depth + 1, 1, cb, cr)
+        try transform_tree(c, x0, y0 + half, x0, y0, log2 - 1, depth + 1, 2, cb, cr)
+        try transform_tree(c, x0 + half, y0 + half, x0, y0, log2 - 1, depth + 1, 3, cb, cr)
+        return
+    let luma = c.cabac.decode(ctx_cbf_luma + (1 if depth == 0 else 0)) == 1
+    try transform_unit(c, x0, y0, xb, yb, log2, block, luma, cb, cr)
+
+## transform_unit(): cu_qp_delta, then luma and chroma prediction and residuals.
+func transform_unit(c: Ctx*, x0: usize, y0: usize, xb: usize, yb: usize, log2: u32, block: u32, luma: bool, cb: bool, cr: bool) -> !:
+    let pic = c.pic
+    let chroma = pic.chroma != 0
+    if (luma or (chroma and (cb or cr))) and c.pps.cu_qp_delta and not c.qp_delta_coded:
+        var v: u32 = 0
+        while v < 5 and c.cabac.decode(ctx_qp_delta + (1 if v > 0 else 0)) == 1:
+            v += 1
+        if v == 5:
+            var k: u32 = 0
+            while c.cabac.bypass() == 1:
+                v += (u32)1 << k
+                k += 1
+                if k > 16:
+                    error(corrupt, "HEVC cu_qp_delta is too large")
+            v += c.cabac.bypass_bits(k)
+        let offset = 6 * (i32)(c.sps.bits - 8)
+        if v > (u32)(26 + offset // 2):
+            error(corrupt, "HEVC cu_qp_delta is out of range")
+        c.qp_delta = -(i32)v if v > 0 and c.cabac.bypass() == 1 else (i32)v
+        if c.qp_delta > 25 + offset // 2:
+            error(corrupt, "HEVC cu_qp_delta is out of range")
+        c.qp_delta_coded = true
+        update_qp(c)
+    let size = (usize)1 << log2
+    predict(c, 0, x0, y0, log2, (u32)pic.modes[pic.unit_at(x0, y0)])
+    if luma:
+        try residual(c, 0, x0, y0, log2)
+    pic.mark(x0, y0, size, unit_decoded)
+    mark_edges(c, x0, y0, size)
+    if not chroma:
+        return
+    if log2 > 2:
+        for component: u32 in 1..=2:
+            predict(c, component, x0 >> 1, y0 >> 1, log2 - 1, c.chroma_mode)
+            if (cb if component == 1 else cr):
+                try residual(c, component, x0 >> 1, y0 >> 1, log2 - 1)
+    elif block == 3:
+        for component: u32 in 1..=2:
+            predict(c, component, xb >> 1, yb >> 1, 2, c.chroma_mode)
+            if (cb if component == 1 else cr):
+                try residual(c, component, xb >> 1, yb >> 1, 2)

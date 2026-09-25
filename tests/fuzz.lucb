@@ -1,0 +1,85 @@
+#==============================================================================================
+#
+#   fuzz - A longer malformed-input campaign than the gate runs: `fuzz seed variants
+#   file.heic...` decodes `variants` mutated copies of each file (truncations, random
+#   bytes, bit flips, zeroed and duplicated runs). A trap ends the run and names the case;
+#   errors are the expected outcome.
+#
+#==============================================================================================
+
+import c
+import files
+import memory
+import heic
+from raster import Raster
+
+## A 64-bit LCG.
+struct Random:
+    var state: u64
+
+    mutating func below(bound: usize) -> usize:
+        self.state = self.state *% 6364136223846793005 +% 1442695040888963407
+        return (usize)(self.state >> 33) % bound
+
+## Applies one of five mutations to `copy`; returns the length to decode.
+func mutate(copy: u8[], random: Random*) -> usize:
+    let n = copy.length
+    let kind = random.below(5)
+    if kind == 0:
+        return random.below(n)
+    for k in 0..<1 + random.below(8):
+        let at = random.below(n)
+        if kind == 1:
+            copy[at] = (u8)random.below(256)
+        elif kind == 2:
+            copy[at] ^= (u8)1 << (u8)random.below(8)
+        elif kind == 3:
+            let run = random.below(64) + 1
+            for i in at..<(at + run if at + run < n else n):
+                copy[i] = 0
+        else:
+            let source = random.below(n)
+            let run = random.below(32) + 1
+            for i in 0..<run:
+                if at + i < n and source + i < n:
+                    copy[at + i] = copy[source + i]
+    return n
+
+func main(arguments: c.str[]) -> i32!:
+    if arguments.length < 4:
+        print("usage: fuzz seed variants file.heic...")
+        return 2
+    var random = Random(state = (u64)(try str(arguments[1])).length * 7919)
+    for ch in (try str(arguments[1])).bytes:
+        random.state = random.state * 31 +% (u64)ch
+    var variants: usize = 0
+    for ch in (try str(arguments[2])).bytes:
+        variants = variants * 10 + (usize)(ch - '0')
+    var total: usize = 0
+    for f in 3..<arguments.length:
+        var data: u8[]
+        with memory.heap:
+            data = try files.read(arguments[f])
+        defer free(data) in memory.heap
+        let copy = try new u8[data.length] in memory.heap
+        defer free(copy) in memory.heap
+        for v in 0..<variants:
+            memory.copy(copy, data, data.length)
+            let size = mutate(copy, &random)
+            var planes: heic.Planes
+            defer planes.close()
+            heic.decode_planes(copy[..<size], &planes, max_bytes = 268435456, max_pixels = 16777216, threads = 2) catch failure:
+                recover ()
+            var image = Raster(max_bytes = 268435456, max_pixels = 16777216)
+            defer image.close()
+            image.encoded = try new u8[size] in memory.heap
+            memory.copy(image.encoded, copy, size)
+            heic.probe(&image) catch failure:
+                continue
+            image.allocate() catch failure:
+                continue
+            heic.decode(&image) catch failure:
+                recover ()
+            total += 1
+    print(f"{total} mutated variants decoded or failed cleanly")
+    return 0

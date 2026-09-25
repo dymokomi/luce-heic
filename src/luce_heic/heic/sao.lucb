@@ -1,0 +1,119 @@
+#==============================================================================================
+#
+#   heic/sao - Sample adaptive offset (8.7.3)
+#
+#   Each CTB and component either adds one of four offsets by sample band, or classifies
+#   each sample against its two neighbours along an edge direction. Samples are read from
+#   a copy of the deblocked plane. Neighbours across a slice or tile boundary whose flags
+#   forbid in-loop filtering, or outside the picture, leave the sample unchanged, as do
+#   PCM samples with loop filtering disabled and transquant bypass samples.
+#
+#==============================================================================================
+
+## The neighbour offsets (hPos, vPos) of the first neighbour for edge classes 0-3; the
+## second neighbour is the mirror image.
+let edge_dx: i32[4] = [-1, 0, -1, 1]
+let edge_dy: i32[4] = [0, -1, -1, -1]
+
+## Applies SAO to every component of the picture.
+func apply_sao(pic: Picture*) -> !:
+    for component: u32 in 0..<(3 if pic.chroma != 0 else 1):
+        var used = false
+        for s in pic.sao:
+            if s.kind[component] != 0:
+                used = true
+                break
+        if not used:
+            continue
+        let plane = pic.plane(component)
+        let source = try alloc u16[plane.length] in memory.heap
+        defer free(source) in memory.heap
+        memory.copy(source, plane, plane.length)
+        for rs in 0..<pic.sao.length:
+            if pic.sao[rs].kind[component] != 0:
+                sao_ctb(pic, component, rs, source, plane)
+
+## Whether in-loop filtering may use samples of CTB `other` for CTB `rs` (8.7.3.2).
+func sao_allowed(pic: const Picture*, rs: usize, other: usize) -> bool:
+    if other == rs:
+        return true
+    if pic.ctb_slice[other] == 0:
+        return false
+    let own = &pic.slices[(usize)pic.ctb_slice[rs] - 1]
+    let theirs = &pic.slices[(usize)pic.ctb_slice[other] - 1]
+    if own.address != theirs.address:
+        let earlier = pic.rs_to_ts[other] < pic.rs_to_ts[rs]
+        if (earlier and not own.across_slices) or (not earlier and not theirs.across_slices):
+            return false
+    return pic.ctb_tile[other] == pic.ctb_tile[rs] or pic.across_tiles
+
+## SAO for component `component` of the CTB at raster address `rs`.
+func sao_ctb(pic: Picture*, component: u32, rs: usize, source: const u16[], plane: u16[]):
+    let s = &pic.sao[rs]
+    let shift: u32 = 0 if component == 0 else 1
+    let stride = pic.width if component == 0 else pic.cwidth
+    let rows = pic.height if component == 0 else pic.cheight
+    let size = ((usize)1 << pic.log2_ctb) >> shift
+    let x0 = (rs % pic.ctbs_w) * size
+    let y0 = (rs // pic.ctbs_w) * size
+    let x1 = x0 + size if x0 + size < stride else stride
+    let y1 = y0 + size if y0 + size < rows else rows
+    let depth = pic.bits if component == 0 else pic.bits_c
+    let high = ((i32)1 << depth) - 1
+    let base = (usize)component * 4
+    if s.kind[component] == 1:
+        var bands: i32[32]
+        for k in 0..<(usize)4:
+            bands[((usize)s.detail[component] + k) & 31] = (i32)s.offsets[base + k]
+        for y in y0..<y1:
+            for x in x0..<x1:
+                if (pic.flags[pic.unit_at(x << shift, y << shift)] & unit_unfiltered) != 0:
+                    continue
+                let v = (i32)source[y * stride + x]
+                plane[y * stride + x] = (u16)clamp(v + bands[(usize)(v >> (depth - 5))], 0, high)
+        return
+    let class = (usize)s.detail[component]
+    let dx = edge_dx[class]
+    let dy = edge_dy[class]
+    # Which neighbouring CTBs (3x3 around this one) may be read.
+    var allowed: bool[9]
+    let cx = (i32)(rs % pic.ctbs_w)
+    let cy = (i32)(rs // pic.ctbs_w)
+    for j in 0..<(usize)3:
+        for i in 0..<(usize)3:
+            let nx = cx + (i32)i - 1
+            let ny = cy + (i32)j - 1
+            if nx >= 0 and ny >= 0 and nx < (i32)pic.ctbs_w and ny < (i32)pic.ctbs_h:
+                allowed[j * 3 + i] = sao_allowed(pic, rs, (usize)ny * pic.ctbs_w + (usize)nx)
+    var offsets: i32[5]
+    for k in 0..<(usize)4:
+        offsets[k + 1] = (i32)s.offsets[base + k]
+    for y in y0..<y1:
+        for x in x0..<x1:
+            if (pic.flags[pic.unit_at(x << shift, y << shift)] & unit_unfiltered) != 0:
+                continue
+            let ax = (i32)x + dx
+            let ay = (i32)y + dy
+            let bx = (i32)x - dx
+            let by = (i32)y - dy
+            if ax < 0 or ay < 0 or bx < 0 or by < 0 or ax >= (i32)stride or bx >= (i32)stride or ay >= (i32)rows or by >= (i32)rows:
+                continue
+            if not allowed[region(ax, ay, x0, y0, size)] or not allowed[region(bx, by, x0, y0, size)]:
+                continue
+            let v = (i32)source[y * stride + x]
+            let a = (i32)source[(usize)ay * stride + (usize)ax]
+            let b = (i32)source[(usize)by * stride + (usize)bx]
+            var edge = 2 + signum(v - a) + signum(v - b)
+            if edge <= 2:
+                edge = 0 if edge == 2 else edge + 1
+            if edge != 0:
+                plane[y * stride + x] = (u16)clamp(v + offsets[(usize)edge], 0, high)
+
+## Which cell of the 3x3 CTB neighbourhood holds sample (x, y).
+func region(x: i32, y: i32, x0: usize, y0: usize, size: usize) -> usize:
+    let i: usize = 0 if x < (i32)x0 else 2 if x >= (i32)(x0 + size) else 1
+    let j: usize = 0 if y < (i32)y0 else 2 if y >= (i32)(y0 + size) else 1
+    return j * 3 + i
+
+func signum(v: i32) -> i32:
+    return 1 if v > 0 else -1 if v < 0 else 0

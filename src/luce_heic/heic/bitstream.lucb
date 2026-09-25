@@ -1,0 +1,152 @@
+#==============================================================================================
+#
+#   heic/bitstream - NAL units: length-prefixed framing, emulation prevention and RBSP bits
+#
+#   An image item holds NAL units, each prefixed by its length in 1, 2 or 4 bytes as the
+#   hvcC configuration says; hvcC itself carries the parameter set NAL units. A NAL unit's
+#   payload has emulation prevention bytes (00 00 03) removed before its RBSP is parsed.
+#
+#==============================================================================================
+
+let nal_sps: u32 = 33
+let nal_pps: u32 = 34
+
+## A reader of RBSP bits, most significant first; reading past the end is an error.
+struct Bits:
+    var data: const u8[]
+    var position: usize
+
+    mutating func bit() -> u32!:
+        let index = self.position >> 3
+        if index >= self.data.length:
+            error(corrupt, "HEVC header is truncated")
+        let value = ((u32)self.data[index] >> (7 - (u32)(self.position & 7))) & 1
+        self.position += 1
+        return value
+
+    ## `count` bits, at most 32, as an unsigned integer.
+    mutating func bits(count: u32) -> u32!:
+        var value: u32 = 0
+        var left = count
+        while left > 0:
+            value = (value << 1) | (try self.bit())
+            left -= 1
+        return value
+
+    mutating func flag() -> bool!:
+        return try self.bit() == 1
+
+    ## ue(v): an unsigned Exp-Golomb code of up to 32 significant bits.
+    mutating func ue() -> u32!:
+        var zeros: u32 = 0
+        while try self.bit() == 0:
+            zeros += 1
+            if zeros > 31:
+                error(corrupt, "HEVC Exp-Golomb code is too long")
+        return (u32)((((u64)1 << zeros) - 1) + (u64)(try self.bits(zeros)))
+
+    ## se(v): a signed Exp-Golomb code.
+    mutating func se() -> i32!:
+        let k = (i64)(try self.ue())
+        return (i32)((k + 1) // 2 if (k & 1) == 1 else -(k // 2))
+
+    ## ue(v) that must not exceed `maximum`.
+    mutating func ue_max(maximum: u32) -> u32!:
+        let value = try self.ue()
+        if value > maximum:
+            error(corrupt, "HEVC header value is out of range")
+        return value
+
+    ## se(v) that must lie in `minimum`..=`maximum`.
+    mutating func se_range(minimum: i32, maximum: i32) -> i32!:
+        let value = try self.se()
+        if value < minimum or value > maximum:
+            error(corrupt, "HEVC header value is out of range")
+        return value
+
+    mutating func skip(count: usize) -> !:
+        if count > self.data.length * 8 - self.position:
+            error(corrupt, "HEVC header is truncated")
+        self.position += count
+
+    ## Advances to the next byte boundary.
+    mutating func align():
+        self.position = (self.position + 7) & ~(usize)7
+
+## Copies the NAL unit `nal` into `output` without its emulation prevention bytes and
+## returns the RBSP length.
+func unescape(nal: const u8[], output: u8[]) -> usize:
+    var zeros: usize = 0
+    var count: usize = 0
+    for value in nal:
+        if zeros >= 2 and value == 3:
+            zeros = 0
+            continue
+        output[count] = value
+        count += 1
+        zeros = zeros + 1 if value == 0 else 0
+    return count
+
+## The NAL unit type from the two-byte NAL unit header.
+func nal_type(nal: const u8[]) -> u32:
+    return ((u32)nal[0] >> 1) & 63
+
+## Walks length-prefixed NAL units: `size` is the prefix length (1, 2 or 4 bytes).
+struct Nals:
+    var data: const u8[]
+    var size: usize
+    var position: usize
+
+    ## The next NAL unit, or none at the end of the data.
+    mutating func next() -> (const u8[])?!:
+        if self.position >= self.data.length:
+            return none
+        if self.data.length - self.position < self.size:
+            error(corrupt, "truncated HEVC NAL unit length")
+        var length: usize = 0
+        for i in 0..<self.size:
+            length = (length << 8) | (usize)self.data[self.position + i]
+        self.position += self.size
+        if length < 2 or length > self.data.length - self.position:
+            error(corrupt, "HEVC NAL unit length is out of range")
+        let nal = self.data[self.position..<self.position + length]
+        self.position += length
+        return nal
+
+## An hvcC box body: its format fields, and its parameter-set NAL units one by one.
+struct Config:
+    var data: const u8[]
+    var length_size: usize
+    var chroma: u32
+    var bits: u32
+    var bits_c: u32
+    var arrays: usize
+    var position: usize
+    var left_in_array: usize
+
+    ## Reads the fixed hvcC header fields.
+    static func open(data: const u8[]) -> Config!:
+        if data.length < 23:
+            error(corrupt, "HEVC configuration (hvcC) is truncated")
+        return Config(data = data, length_size = (usize)(data[21] & 3) + 1, chroma = (u32)(data[16] & 3), bits = (u32)(data[17] & 7) + 8, bits_c = (u32)(data[18] & 7) + 8, arrays = (usize)data[22], position = 23)
+
+    ## The next parameter-set NAL unit, or none after the last array.
+    mutating func next() -> (const u8[])?!:
+        while self.left_in_array == 0:
+            if self.arrays == 0:
+                return none
+            if self.data.length - self.position < 3:
+                error(corrupt, "HEVC configuration (hvcC) is truncated")
+            self.left_in_array = ((usize)self.data[self.position + 1] << 8) | (usize)self.data[self.position + 2]
+            self.position += 3
+            self.arrays -= 1
+        if self.data.length - self.position < 2:
+            error(corrupt, "HEVC configuration (hvcC) is truncated")
+        let length = ((usize)self.data[self.position] << 8) | (usize)self.data[self.position + 1]
+        self.position += 2
+        if length < 2 or length > self.data.length - self.position:
+            error(corrupt, "HEVC configuration NAL unit is out of range")
+        self.left_in_array -= 1
+        let nal = self.data[self.position..<self.position + length]
+        self.position += length
+        return nal

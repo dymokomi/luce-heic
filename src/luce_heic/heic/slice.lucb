@@ -1,0 +1,132 @@
+#==============================================================================================
+#
+#   heic/slice - Slice segment headers
+#
+#   A dependent slice segment takes every field after its address from the independent
+#   slice segment before it. Only I slices are decoded; P and B slices are refused.
+#
+#==============================================================================================
+
+## The fields of a slice segment header the decoder uses.
+struct SliceHeader:
+    var first: bool
+    var dependent: bool
+    var address: usize
+    var pps: u32
+    var sao_luma: bool
+    var sao_chroma: bool
+    var qp: i32
+    var cb_offset: i32
+    var cr_offset: i32
+    var deblock_disabled: bool
+    var beta_offset: i32
+    var tc_offset: i32
+    var across_slices: bool
+    ## The byte offset of slice_segment_data() in the RBSP.
+    var data: usize
+
+## Ceil(Log2(value)): the bit length of an index below `value`.
+func ceil_log2(value: usize) -> u32:
+    var bits: u32 = 0
+    while ((usize)1 << bits) < value:
+        bits += 1
+    return bits
+
+## slice_segment_header(): `previous` is the last independent header, which a dependent
+## segment copies; `ctbs` is the picture's size in CTBs.
+func parse_slice_header(bits: Bits*, nal: u32, sps_table: const Sps[], pps_table: const Pps[], previous: const SliceHeader*) -> SliceHeader!:
+    var h = SliceHeader()
+    h.first = try bits.flag()
+    if nal >= 16 and nal <= 23:
+        discard(try bits.flag())
+    h.pps = try bits.ue_max(63)
+    let pps = &pps_table[(usize)h.pps]
+    if not pps.present or not sps_table[(usize)pps.sps].present:
+        error(corrupt, "HEVC slice refers to a missing parameter set")
+    let sps = &sps_table[(usize)pps.sps]
+    let ctb = (usize)1 << sps.log2_ctb
+    let ctbs = ((sps.width + ctb - 1) >> sps.log2_ctb) * ((sps.height + ctb - 1) >> sps.log2_ctb)
+    if not h.first:
+        if pps.dependent_slices:
+            h.dependent = try bits.flag()
+        h.address = (usize)(try bits.bits(ceil_log2(ctbs)))
+        if h.address >= ctbs:
+            error(corrupt, "HEVC slice address is out of range")
+    if h.dependent:
+        let address = h.address
+        h = *previous
+        h.first = false
+        h.dependent = true
+        h.address = address
+    else:
+        try bits.skip((usize)pps.extra_bits)
+        let kind = try bits.ue_max(2)
+        if kind != 2:
+            error(unsupported, "HEVC P and B slices are not supported: only intra-coded images decode")
+        if pps.output_flag:
+            discard(try bits.flag())
+        if nal != 19 and nal != 20:
+            discard(try bits.bits(sps.log2_poc))
+            if not try bits.flag():
+                try skip_rps(bits, sps)
+            elif sps.rps_count > 1:
+                discard(try bits.bits(ceil_log2((usize)sps.rps_count)))
+            if sps.long_term:
+                var from_sps: u32 = 0
+                if sps.long_term_count > 0:
+                    from_sps = try bits.ue_max(sps.long_term_count)
+                let count = from_sps + try bits.ue_max(32)
+                for i in 0..<count:
+                    if i < from_sps:
+                        if sps.long_term_count > 1:
+                            discard(try bits.bits(ceil_log2((usize)sps.long_term_count)))
+                    else:
+                        discard(try bits.bits(sps.log2_poc))
+                        discard(try bits.flag())
+                    if try bits.flag():
+                        discard(try bits.ue())
+            if sps.temporal_mvp:
+                discard(try bits.flag())
+        if sps.sao:
+            h.sao_luma = try bits.flag()
+            if sps.chroma != 0:
+                h.sao_chroma = try bits.flag()
+        let offset = 6 * (i32)(sps.bits - 8)
+        h.qp = pps.init_qp + try bits.se()
+        if h.qp < -offset or h.qp > 51:
+            error(corrupt, "HEVC slice QP is out of range")
+        if pps.slice_chroma_offsets:
+            h.cb_offset = try bits.se_range(-12, 12)
+            h.cr_offset = try bits.se_range(-12, 12)
+        var overridden = false
+        if pps.deblock_override:
+            overridden = try bits.flag()
+        h.deblock_disabled = pps.deblock_disabled
+        h.beta_offset = pps.beta_offset
+        h.tc_offset = pps.tc_offset
+        if overridden:
+            h.deblock_disabled = try bits.flag()
+            if not h.deblock_disabled:
+                h.beta_offset = try bits.se_range(-6, 6) * 2
+                h.tc_offset = try bits.se_range(-6, 6) * 2
+        h.across_slices = pps.across_slices
+        if pps.across_slices and (h.sao_luma or h.sao_chroma or not h.deblock_disabled):
+            h.across_slices = try bits.flag()
+    if pps.tiles or pps.wpp:
+        let entries = try bits.ue_max((u32)ctbs)
+        if entries > 0:
+            let size = try bits.ue_max(31) + 1
+            try bits.skip((usize)entries * (usize)size)
+    if pps.header_extension:
+        try bits.skip((usize)(try bits.ue_max(256)) * 8)
+    if try bits.bit() != 1:
+        error(corrupt, "HEVC slice header alignment bit is missing")
+    bits.align()
+    h.data = bits.position >> 3
+    return h
+
+## A short-term reference picture set coded in the slice header, skipped.
+func skip_rps(bits: Bits*, sps: const Sps*) -> !:
+    var copy = *sps
+    var deltas: i32[2048]
+    try parse_rps(bits, &copy, sps.rps_count, deltas)

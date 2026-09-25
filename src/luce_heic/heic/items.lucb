@@ -1,0 +1,320 @@
+#==============================================================================================
+#
+#   heic/items - Image items: the primary image's layout, coded and grid items, and alpha
+#
+#   A coded item (hvc1) is one HEVC picture cropped by its conformance window. A grid item
+#   lists tiles (dimg) that are decoded one by one and copied into the output canvas,
+#   clipped at its right and bottom. An alpha plane comes from an auxiliary item (auxl)
+#   whose auxC names the HEVC or CICP alpha type.
+#
+#==============================================================================================
+
+## One geometric transform, applied to the decoded image in association order.
+struct Transform:
+    var kind: u32
+    ## irot: the anticlockwise quarter turns; imir: 0 flips top to bottom, 1 left to
+    ## right, as libheif and macOS read the axis field.
+    var value: u32
+    ## clap: the crop rectangle.
+    var left: usize
+    var top: usize
+    var width: usize
+    var height: usize
+
+## What the container says about the primary image.
+struct Layout:
+    var primary: usize
+    ## One more than the alpha item's index; 0 when there is no alpha.
+    var alpha: usize
+    ## The decoded size (ispe), and the size after the transforms.
+    var coded_width: usize
+    var coded_height: usize
+    var width: usize
+    var height: usize
+    var bits: u32
+    var monochrome: bool
+    var icc: const u8[]
+    ## nclx matrix_coefficients and full_range_flag; -1 when there is no nclx.
+    var matrix: i32
+    var full_range: i32
+    var transforms: Transform[4]
+    var transform_count: usize
+
+## Refuses essential properties this decoder does not implement.
+func check_properties(heif: const Heif*, item: const Item*) -> !:
+    for i in 0..<item.property_count:
+        let index = (usize)(item.properties[i] & 32767)
+        if index == 0 or index > heif.properties.length:
+            if index != 0:
+                error(corrupt, "HEIF property index is out of range")
+            continue
+        if (item.properties[i] & 32768) != 0:
+            var known = false
+            for kind in known_properties:
+                known = known or heif.properties[index - 1].kind == kind
+            if not known:
+                error(unsupported, "HEIF image has an essential property this decoder does not support")
+
+## The image size an item's ispe states.
+func item_size(heif: const Heif*, item: const Item*) -> (usize, usize)!:
+    let ispe = heif.property(item, box_ispe) else error(corrupt, "HEIF image item has no ispe")
+    var r = try ispe.reader(heif.data, 4)
+    let width = (usize)(try r.uint(4))
+    let height = (usize)(try r.uint(4))
+    if width == 0 or height == 0 or width > 1000000 or height > 1000000:
+        error(corrupt, "HEIF image size is out of range")
+    return (width, height)
+
+## The hvcC of a coded item, or of a grid's first tile.
+func item_config(heif: const Heif*, item: const Item*) -> Config!:
+    var coded = item
+    if item.kind == item_grid:
+        if item.tile_count == 0:
+            error(corrupt, "HEIF grid has no tiles")
+        coded = &heif.items[try heif.find(heif.tiles[item.first_tile])]
+    if coded.kind != item_hvc1:
+        error(unsupported, "HEIF image is not HEVC coded")
+    let hvcc = heif.property(coded, box_hvcc) else error(corrupt, "HEIF image item has no hvcC")
+    return try Config.open(heif.data[hvcc.body..<hvcc.end])
+
+## Describes the primary image: sizes, bit depth, color, transforms and alpha.
+func describe(heif: const Heif*) -> Layout!:
+    var layout = Layout(matrix = -1, full_range = -1)
+    layout.primary = try heif.find(heif.primary)
+    let item = &heif.items[layout.primary]
+    if item.kind != item_hvc1 and item.kind != item_grid:
+        error(unsupported, "HEIF primary image is not an HEVC or grid image (AVIF, overlays and others are not supported)")
+    try check_properties(heif, item)
+    let (width, height) = try item_size(heif, item)
+    layout.coded_width = width
+    layout.coded_height = height
+    let config = try item_config(heif, item)
+    layout.bits = config.bits
+    layout.monochrome = config.chroma == 0
+    if config.chroma > 1:
+        error(unsupported, "HEIC 4:2:2 and 4:4:4 chroma are not supported")
+    var w = width
+    var h = height
+    for i in 0..<item.property_count:
+        let index = (usize)(item.properties[i] & 32767)
+        if index == 0:
+            continue
+        let p = heif.properties[index - 1]
+        if p.kind == box_colr:
+            try colr_property(heif, p, &layout)
+        elif p.kind == box_clap or p.kind == box_irot or p.kind == box_imir:
+            if layout.transform_count == 4:
+                error(unsupported, "HEIF image has too many transforms")
+            var t = Transform(kind = p.kind)
+            var r = try p.reader(heif.data)
+            if p.kind == box_irot:
+                t.value = (u32)(try r.byte()) & 3
+                if (t.value & 1) == 1:
+                    let swap = w
+                    w = h
+                    h = swap
+            elif p.kind == box_imir:
+                t.value = (u32)(try r.byte()) & 1
+            else:
+                try clean_aperture(&r, w, h, &t)
+                w = t.width
+                h = t.height
+            layout.transforms[layout.transform_count] = t
+            layout.transform_count += 1
+    layout.width = w
+    layout.height = h
+    if item.kind == item_grid and layout.matrix < 0 and layout.icc.length == 0:
+        # A grid without colr takes its first tile's, as macOS does.
+        try read_colr(heif, &heif.items[try heif.find(heif.tiles[item.first_tile])], &layout)
+    for i in 0..<heif.items.length:
+        let candidate = &heif.items[i]
+        if candidate.auxiliary_of == heif.primary and (candidate.kind == item_hvc1 or candidate.kind == item_grid):
+            if let aux = heif.property(candidate, box_auxc):
+                var r = try aux.reader(heif.data, 4)
+                let name = try r.cstring()
+                if name == "urn:mpeg:hevc:2015:auxid:1" or name == "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha":
+                    try check_properties(heif, candidate)
+                    layout.alpha = i + 1
+    return layout
+
+## Reads a colr property: nclx into the matrix and range, an ICC profile into `icc`.
+func colr_property(heif: const Heif*, p: Box, layout: Layout*) -> !:
+    var r = try p.reader(heif.data)
+    let kind = (u32)(try r.uint(4))
+    if kind == colr_nclx and layout.matrix < 0:
+        discard(try r.uint(4))
+        layout.matrix = (i32)(try r.uint(2))
+        layout.full_range = (i32)(try r.byte() >> 7)
+    elif (kind == colr_prof or kind == colr_ricc) and layout.icc.length == 0:
+        layout.icc = r.data[4..]
+
+## Reads every colr property of `item`.
+func read_colr(heif: const Heif*, item: const Item*, layout: Layout*) -> !:
+    for i in 0..<item.property_count:
+        let index = (usize)(item.properties[i] & 32767)
+        if index > 0 and index <= heif.properties.length and heif.properties[index - 1].kind == box_colr:
+            try colr_property(heif, heif.properties[index - 1], layout)
+
+## The clap crop of a `width` by `height` image, rounded down as ISO/IEC 23008-12 does.
+func clean_aperture(r: Reader*, width: usize, height: usize, t: Transform*) -> !:
+    var values: f64[8]
+    for i in 0..<(usize)8:
+        let raw = try r.uint(4)
+        values[i] = (f64)(i32)(u32)raw if i >= 4 and (i & 1) == 0 else (f64)raw
+    if values[1] == 0.0 or values[3] == 0.0 or values[5] == 0.0 or values[7] == 0.0:
+        error(corrupt, "HEIF clean aperture has a zero denominator")
+    let clean_w = values[0] / values[1]
+    let clean_h = values[2] / values[3]
+    let centre_x = values[4] / values[5] + ((f64)width - 1.0) / 2.0
+    let centre_y = values[6] / values[7] + ((f64)height - 1.0) / 2.0
+    let left = math.floor(centre_x - (clean_w - 1.0) / 2.0)
+    let right = math.floor(centre_x + (clean_w - 1.0) / 2.0)
+    let top = math.floor(centre_y - (clean_h - 1.0) / 2.0)
+    let bottom = math.floor(centre_y + (clean_h - 1.0) / 2.0)
+    if not (left >= 0.0 and top >= 0.0 and right >= left and bottom >= top and right < (f64)width and bottom < (f64)height):
+        error(corrupt, "HEIF clean aperture lies outside the image")
+    t.left = (usize)left
+    t.top = (usize)top
+    t.width = (usize)(right - left) + 1
+    t.height = (usize)(bottom - top) + 1
+
+## Decodes the primary image, and its alpha plane, into `planes`.
+func render(heif: const Heif*, layout: const Layout*, planes: Planes*, max_bytes: usize, max_pixels: usize, threads: usize) -> !:
+    try render_item(heif, layout.primary, planes, max_bytes, max_pixels, threads)
+    if planes.width != layout.coded_width or planes.height != layout.coded_height:
+        error(corrupt, "HEIF image size differs from its coded pictures")
+    if (planes.chroma == 0) != layout.monochrome or planes.bits != layout.bits:
+        error(corrupt, "HEVC stream format differs from its hvcC configuration")
+    if layout.alpha != 0:
+        var alpha = Planes()
+        defer alpha.close()
+        try render_item(heif, layout.alpha - 1, &alpha, max_bytes, max_pixels, threads)
+        if alpha.width != planes.width or alpha.height != planes.height:
+            error(corrupt, "HEIF alpha image size differs from the image")
+        planes.alpha = alpha.luma
+        planes.alpha_bits = alpha.bits
+        var moved: u16[]
+        alpha.luma = moved
+    # The color description: nclx, else the stream's VUI (range absent means limited, as
+    # HEVC infers), else BT.709 for an unspecified matrix, as macOS ImageIO decodes.
+    planes.matrix = (u32)layout.matrix if layout.matrix >= 0 else planes.matrix
+    if planes.matrix == 2:
+        planes.matrix = 1
+    planes.full_range = layout.full_range == 1 if layout.full_range >= 0 else planes.full_range
+
+## Decodes item `index` (coded or grid) into `planes`.
+func render_item(heif: const Heif*, index: usize, planes: Planes*, max_bytes: usize, max_pixels: usize, threads: usize) -> !:
+    let item = &heif.items[index]
+    if item.kind == item_hvc1:
+        var pic = Picture()
+        defer pic.close()
+        try decode_coded(heif, item, &pic, max_bytes, max_pixels)
+        try start_planes(planes, &pic, pic.width - pic.crop_left - pic.crop_right, pic.height - pic.crop_top - pic.crop_bottom, max_bytes)
+        copy_picture(&pic, planes, 0, 0)
+        return
+    if item.kind != item_grid:
+        error(unsupported, "HEIF image item is not HEVC coded")
+    var descriptor = Buffer(maximum = 64)
+    defer descriptor.close()
+    try heif.item_data(item, &descriptor)
+    var r = Reader(data = descriptor.view(), little = false)
+    if try r.byte() != 0:
+        error(unsupported, "unsupported HEIF grid version")
+    let wide = ((try r.byte()) & 1) != 0
+    let rows = (usize)(try r.byte()) + 1
+    let columns = (usize)(try r.byte()) + 1
+    let width = (usize)(try r.uint(4 if wide else 2))
+    let height = (usize)(try r.uint(4 if wide else 2))
+    if rows * columns != item.tile_count or width == 0 or height == 0:
+        error(corrupt, "HEIF grid does not match its tiles")
+    if width * height > max_pixels:
+        error(limit, "HEIF grid exceeds the pixel limit")
+    # The first tile fixes the tile size and format; the rest decode in parallel.
+    var grid = Grid(heif = heif, item = item, planes = planes, columns = columns, max_bytes = max_bytes, max_pixels = max_pixels)
+    var pic = Picture()
+    defer pic.close()
+    try decode_coded(heif, try grid.tile(0), &pic, max_bytes, max_pixels)
+    grid.tile_w = pic.width - pic.crop_left - pic.crop_right
+    grid.tile_h = pic.height - pic.crop_top - pic.crop_bottom
+    if grid.tile_w * columns < width or grid.tile_h * rows < height:
+        error(corrupt, "HEIF grid tiles do not cover the image")
+    try start_planes(planes, &pic, width, height, max_bytes)
+    planes.tile_width = grid.tile_w
+    planes.tile_height = grid.tile_h
+    copy_picture(&pic, planes, 0, 0)
+    try run_tasks(item.tile_count - 1, threads, decode_tile, (void*)&grid)
+
+## A grid being decoded: where its tiles go.
+struct Grid:
+    var heif: const Heif*
+    var item: const Item*
+    var planes: Planes*
+    var columns: usize
+    var tile_w: usize
+    var tile_h: usize
+    var max_bytes: usize
+    var max_pixels: usize
+
+    ## The coded item of tile `t`.
+    func tile(t: usize) -> const Item*!:
+        let tile = &self.heif.items[try self.heif.find(self.heif.tiles[self.item.first_tile + t])]
+        if tile.kind != item_hvc1:
+            error(unsupported, "HEIF grid tile is not HEVC coded")
+        return tile
+
+## Decodes grid tile `task + 1` and copies it into place.
+func decode_tile(raw: void*, task: usize) -> !:
+    let grid = (Grid*)raw
+    let t = task + 1
+    var pic = Picture()
+    defer pic.close()
+    try decode_coded(grid.heif, try grid.tile(t), &pic, grid.max_bytes, grid.max_pixels)
+    if pic.width - pic.crop_left - pic.crop_right != grid.tile_w or pic.height - pic.crop_top - pic.crop_bottom != grid.tile_h or pic.bits != grid.planes.bits or pic.chroma != grid.planes.chroma or pic.bits_c != pic.bits:
+        error(corrupt, "HEIF grid tiles differ in size or format")
+    copy_picture(&pic, grid.planes, (t % grid.columns) * grid.tile_w, (t // grid.columns) * grid.tile_h)
+
+## Decodes one coded (hvc1) item into `pic`.
+func decode_coded(heif: const Heif*, item: const Item*, pic: Picture*, max_bytes: usize, max_pixels: usize) -> !:
+    let hvcc = heif.property(item, box_hvcc) else error(corrupt, "HEIF image item has no hvcC")
+    var data = Buffer(maximum = max_bytes)
+    defer data.close()
+    try heif.item_data(item, &data)
+    try decode_picture(heif.data[hvcc.body..<hvcc.end], data.view(), pic, max_bytes, max_pixels)
+
+## Allocates `planes` at `width` by `height` in the format of `pic`.
+func start_planes(planes: Planes*, pic: const Picture*, width: usize, height: usize, max_bytes: usize) -> !:
+    planes.width = width
+    planes.height = height
+    planes.chroma = pic.chroma
+    planes.bits = pic.bits
+    planes.matrix = (u32)pic.matrix if pic.matrix >= 0 else 2
+    planes.full_range = pic.full_range == 1
+    if pic.bits_c != pic.bits:
+        error(unsupported, "HEVC luma and chroma bit depths differ")
+    let chroma = ((width + 1) >> 1) * ((height + 1) >> 1) if pic.chroma != 0 else 0
+    if (width * height + 2 * chroma) * 2 > max_bytes:
+        error(limit, "HEIF image exceeds the byte limit")
+    with memory.heap:
+        planes.luma = try new u16[width * height]
+        if pic.chroma != 0:
+            planes.cb = try new u16[chroma]
+            planes.cr = try new u16[chroma]
+
+## Copies the cropped picture into `planes` at (x, y), clipped to the planes.
+func copy_picture(pic: const Picture*, planes: Planes*, x: usize, y: usize):
+    let w = pic.width - pic.crop_left - pic.crop_right
+    let h = pic.height - pic.crop_top - pic.crop_bottom
+    let columns = w if x + w <= planes.width else planes.width - x
+    let rows = h if y + h <= planes.height else planes.height - y
+    for row in 0..<rows:
+        let source = (pic.crop_top + row) * pic.width + pic.crop_left
+        memory.copy(planes.luma[(y + row) * planes.width + x..], pic.luma[source..], columns)
+    if pic.chroma == 0:
+        return
+    let cw = (planes.width + 1) >> 1
+    let ccolumns = (columns + 1) >> 1
+    for row in 0..<(rows + 1) >> 1:
+        let source = ((pic.crop_top >> 1) + row) * pic.cwidth + (pic.crop_left >> 1)
+        let target = ((y >> 1) + row) * cw + (x >> 1)
+        memory.copy(planes.cb[target..], pic.cb[source..], ccolumns)
+        memory.copy(planes.cr[target..], pic.cr[source..], ccolumns)

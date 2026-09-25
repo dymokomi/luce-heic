@@ -1,0 +1,130 @@
+#==============================================================================================
+#
+#   heic/filters - The deblocking filter (8.7.2)
+#
+#   Every edge marked during parsing is a transform or prediction block edge on the 8x8
+#   luma grid between intra blocks, so its boundary strength is 2. All vertical edges of
+#   the picture are filtered first, then all horizontal edges on that result. Chroma edges
+#   lie on the 8x8 chroma grid (every 16 luma samples for 4:2:0).
+#
+#==============================================================================================
+
+## Table 8-12: β' by Q (0-51) and tC' by Q (0-53).
+let beta_table: u8[52] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64]
+let tc_table: u8[54] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 22, 24]
+
+## Deblocks the whole picture.
+func deblock(pic: Picture*):
+    let w = pic.units_w
+    for pass in 0..<(usize)2:
+        let vertical = pass == 0
+        let bit = unit_edge_left if vertical else unit_edge_top
+        for uy in 0..<pic.units_h:
+            for ux in 0..<w:
+                let q = uy * w + ux
+                if (pic.flags[q] & bit) == 0:
+                    continue
+                let p = q - 1 if vertical else q - w
+                let x = ux << 2
+                let y = uy << 2
+                let info = &pic.slices[(usize)pic.ctb_slice[pic.ctb(x, y)] - 1]
+                let qp_p = (i32)pic.qps[p]
+                let qp_q = (i32)pic.qps[q]
+                let keep_p = (pic.flags[p] & unit_unfiltered) != 0
+                let keep_q = (pic.flags[q] & unit_unfiltered) != 0
+                filter_luma(pic, x, y, vertical, (qp_p + qp_q + 1) >> 1, info.beta_offset, info.tc_offset, keep_p, keep_q)
+                if pic.chroma != 0 and ((x if vertical else y) & 15) == 0:
+                    for component: u32 in 1..=2:
+                        filter_chroma(pic, component, x >> 1, y >> 1, vertical, (qp_p + qp_q + 1) >> 1, info.tc_offset, keep_p, keep_q)
+
+## Filters the four luma lines of the edge segment whose first q0 sample is (x, y)
+## (8.7.2.5.3 and 8.7.2.5.7). `keep_p` and `keep_q` leave a side unmodified (PCM with
+## loop filtering disabled, or transquant bypass).
+func filter_luma(pic: Picture*, x: usize, y: usize, vertical: bool, qp: i32, beta_offset: i32, tc_offset: i32, keep_p: bool, keep_q: bool):
+    let plane = pic.luma
+    let stride = pic.width
+    let across: usize = 1 if vertical else stride
+    let along: usize = stride if vertical else 1
+    let origin = y * stride + x
+    let scale = (i32)1 << (pic.bits - 8)
+    let beta = (i32)beta_table[(usize)clamp(qp + beta_offset, 0, 51)] * scale
+    let tc = (i32)tc_table[(usize)clamp(qp + 2 + tc_offset, 0, 53)] * scale
+    let first = origin
+    let last = origin + 3 * along
+    let dp0 = abs_i32(sample(plane, first, across, -3) - 2 * sample(plane, first, across, -2) + sample(plane, first, across, -1))
+    let dp3 = abs_i32(sample(plane, last, across, -3) - 2 * sample(plane, last, across, -2) + sample(plane, last, across, -1))
+    let dq0 = abs_i32(sample(plane, first, across, 2) - 2 * sample(plane, first, across, 1) + sample(plane, first, across, 0))
+    let dq3 = abs_i32(sample(plane, last, across, 2) - 2 * sample(plane, last, across, 1) + sample(plane, last, across, 0))
+    if dp0 + dq0 + dp3 + dq3 >= beta:
+        return
+    let strong = strong_line(plane, first, across, 2 * (dp0 + dq0), beta, tc) and strong_line(plane, last, across, 2 * (dp3 + dq3), beta, tc)
+    let side = (beta + (beta >> 1)) >> 3
+    let extend_p = dp0 + dp3 < side
+    let extend_q = dq0 + dq3 < side
+    let high = ((i32)1 << pic.bits) - 1
+    for k in 0..<(usize)4:
+        let at = origin + k * along
+        let p0 = sample(plane, at, across, -1)
+        let p1 = sample(plane, at, across, -2)
+        let p2 = sample(plane, at, across, -3)
+        let q0 = sample(plane, at, across, 0)
+        let q1 = sample(plane, at, across, 1)
+        let q2 = sample(plane, at, across, 2)
+        if strong:
+            let p3 = sample(plane, at, across, -4)
+            let q3 = sample(plane, at, across, 3)
+            if not keep_p:
+                plane[at - across] = (u16)clamp((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3, p0 - 2 * tc, p0 + 2 * tc)
+                plane[at - 2 * across] = (u16)clamp((p2 + p1 + p0 + q0 + 2) >> 2, p1 - 2 * tc, p1 + 2 * tc)
+                plane[at - 3 * across] = (u16)clamp((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3, p2 - 2 * tc, p2 + 2 * tc)
+            if not keep_q:
+                plane[at] = (u16)clamp((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3, q0 - 2 * tc, q0 + 2 * tc)
+                plane[at + across] = (u16)clamp((p0 + q0 + q1 + q2 + 2) >> 2, q1 - 2 * tc, q1 + 2 * tc)
+                plane[at + 2 * across] = (u16)clamp((p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3, q2 - 2 * tc, q2 + 2 * tc)
+        else:
+            var delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4
+            if abs_i32(delta) >= tc * 10:
+                continue
+            delta = clamp(delta, -tc, tc)
+            if not keep_p:
+                plane[at - across] = (u16)clamp(p0 + delta, 0, high)
+                if extend_p:
+                    let dp = clamp((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1, -(tc >> 1), tc >> 1)
+                    plane[at - 2 * across] = (u16)clamp(p1 + dp, 0, high)
+            if not keep_q:
+                plane[at] = (u16)clamp(q0 - delta, 0, high)
+                if extend_q:
+                    let dq = clamp((((q2 + q0 + 1) >> 1) - q1 - delta) >> 1, -(tc >> 1), tc >> 1)
+                    plane[at + across] = (u16)clamp(q1 + dq, 0, high)
+
+## The sample `offset` steps across the edge from q0 at `at` (negative for the p side).
+func sample(plane: const u16[], at: usize, across: usize, offset: isize) -> i32:
+    return (i32)plane[at - across * (usize)(-offset)] if offset < 0 else (i32)plane[at + across * (usize)offset]
+
+## The strong filter decision dSam for one line (8.7.2.5.6).
+func strong_line(plane: const u16[], at: usize, across: usize, dpq: i32, beta: i32, tc: i32) -> bool:
+    let p0 = sample(plane, at, across, -1)
+    let q0 = sample(plane, at, across, 0)
+    return dpq < (beta >> 2) and abs_i32(sample(plane, at, across, -4) - p0) + abs_i32(q0 - sample(plane, at, across, 3)) < (beta >> 3) and abs_i32(p0 - q0) < ((5 * tc + 1) >> 1)
+
+## Filters the two chroma lines of component `component` whose first q0 sample is
+## (x, y) in chroma samples (8.7.2.5.5).
+func filter_chroma(pic: Picture*, component: u32, x: usize, y: usize, vertical: bool, qp: i32, tc_offset: i32, keep_p: bool, keep_q: bool):
+    let plane = pic.plane(component)
+    let stride = pic.cwidth
+    let across: usize = 1 if vertical else stride
+    let along: usize = stride if vertical else 1
+    let qpc = chroma_qp(qp + (pic.cb_offset if component == 1 else pic.cr_offset))
+    let tc = (i32)tc_table[(usize)clamp(qpc + 2 + tc_offset, 0, 53)] * ((i32)1 << (pic.bits_c - 8))
+    let high = ((i32)1 << pic.bits_c) - 1
+    for k in 0..<(usize)2:
+        let at = y * stride + x + k * along
+        let p0 = sample(plane, at, across, -1)
+        let p1 = sample(plane, at, across, -2)
+        let q0 = sample(plane, at, across, 0)
+        let q1 = sample(plane, at, across, 1)
+        let delta = clamp((((q0 - p0) << 2) + p1 - q1 + 4) >> 3, -tc, tc)
+        if not keep_p:
+            plane[at - across] = (u16)clamp(p0 + delta, 0, high)
+        if not keep_q:
+            plane[at] = (u16)clamp(q0 - delta, 0, high)

@@ -1,0 +1,136 @@
+#==============================================================================================
+#
+#   heic - A HEIC/HEIF still-image decoder
+#
+#   DESCRIPTION:
+#       Reads the primary image of a HEIF file whose pictures are HEVC coded, as iPhones and
+#       macOS write them: the ISO BMFF container, grid images made of tiles, an auxiliary
+#       alpha image, the clean aperture, rotation and mirroring, and the nclx or ICC color
+#       description. The HEVC decoder is intra only (I slices of the Main, Main 10 and Main
+#       Still Picture profiles, 4:2:0 and 4:0:0 up to 12 bits) with tiles, wavefront rows,
+#       scaling lists, PCM, transform skip, lossless blocks, deblocking and SAO. Everything is
+#       Luce Base: no platform codec is used. Fragments, in ORDER:
+#
+#       module.lucb     the public API: is_heic, probe, decode, decode_planes
+#       container.lucb  ISO BMFF boxes, items, properties, references and item data
+#       bitstream.lucb  NAL framing, emulation prevention and Exp-Golomb bit reading
+#       params.lucb     VPS/SPS/PPS parsing and scaling lists
+#       slice.lucb      slice segment headers
+#       cabac.lucb      the arithmetic decoder and its context initialisation
+#       picture.lucb    the picture, its per-block maps and tile scan tables
+#       syntax.lucb     coding tree units, coding units, transform trees and SAO syntax
+#       residual.lucb   residual coding: last position, significance maps and levels
+#       transform.lucb  dequantisation, scaling lists and the inverse DCT/DST
+#       intra.lucb      reference samples, their filtering and the 35 intra modes
+#       filters.lucb    the deblocking filter
+#       sao.lucb        sample adaptive offset
+#       stream.lucb     decoding one item's HEVC stream into a picture
+#       items.lucb      coded and grid items, alpha, and the image layout
+#       color.lucb      YCbCr to RGB, chroma upsampling, rotation and mirroring
+#       parallel.lucb   running grid tiles and output bands on worker threads
+#       tests.lucb      unit, corpus and malformed-input tests
+#
+#==============================================================================================
+
+import memory
+import math
+import thread
+from binary import Reader, Buffer, slice
+from raster import Raster, SampleType
+from raster_errors import corrupt, unsupported, invalid, limit
+
+## The decoded primary image before color conversion: planes at the image grid's size
+## (tiles assembled, conformance window applied), not yet cropped by the clean aperture,
+## rotated or mirrored. Samples are integers of `bits` bits.
+pub struct Planes:
+    pub var width: usize
+    pub var height: usize
+    ## 0 for monochrome (luma only), 1 for 4:2:0 chroma.
+    pub var chroma: u32
+    pub var bits: u32
+    pub var luma: u16[]
+    ## The chroma planes, `(width + 1) // 2` by `(height + 1) // 2`, empty when monochrome.
+    pub var cb: u16[]
+    pub var cr: u16[]
+    ## The auxiliary alpha image's luma, the same size as `luma`, or empty.
+    pub var alpha: u16[]
+    pub var alpha_bits: u32
+    ## The YCbCr to RGB matrix (ISO/IEC 23091-2 MatrixCoefficients: 1 BT.709, 5 and 6
+    ## BT.601, 9 BT.2020, 0 GBR) and range, from the nclx box, else the stream's VUI,
+    ## else BT.709 limited range as HEVC and macOS assume. iPhones write nclx or VUI.
+    pub var matrix: u32
+    pub var full_range: bool
+    ## The tile size of a grid image, 0 for a single coded picture.
+    pub var tile_width: usize
+    pub var tile_height: usize
+
+    pub mutating func close():
+        with memory.heap:
+            if self.luma.length > 0:
+                free(self.luma)
+            if self.cb.length > 0:
+                free(self.cb)
+            if self.cr.length > 0:
+                free(self.cr)
+            if self.alpha.length > 0:
+                free(self.alpha)
+        self = Planes()
+
+## True when `data` starts with an ISO BMFF `ftyp` box whose major or compatible brands
+## name HEVC-coded HEIF (heic, heix, heim, heis, hevc, hevx) or plain HEIF (mif1, msf1).
+pub func is_heic(data: const u8[]) -> bool:
+    if data.length < 16 or data[4] != 'f' or data[5] != 't' or data[6] != 'y' or data[7] != 'p':
+        return false
+    let size = ((usize)data[0] << 24) | ((usize)data[1] << 16) | ((usize)data[2] << 8) | (usize)data[3]
+    let end = size if size >= 16 and size <= data.length else 16
+    var position: usize = 8
+    while position + 4 <= end:
+        if is_brand(read32(data, position)):
+            return true
+        position += 8 if position == 8 else 4
+    return false
+
+## Reads the container and sets the size, channels ("R", "G", "B" and "A", or "Y" and "A"
+## for monochrome), sample type (uint8, or uint16 above 8 bits) and `file_format` "HEIC".
+## An ICC profile becomes the "icc_profile" attribute.
+pub func probe(image: Raster*) -> !:
+    var heif: Heif
+    defer heif.close()
+    try parse_heif(image.encoded, &heif)
+    let layout = try describe(&heif)
+    image.width = layout.width
+    image.height = layout.height
+    image.bits = (usize)layout.bits
+    let count: usize = (1 if layout.monochrome else 3) + (1 if layout.alpha != 0 else 0)
+    try image.standard(count, .uint8 if layout.bits == 8 else .uint16)
+    if layout.icc.length > 0:
+        try image.attribute("icc_profile", "icc", layout.icc)
+    discard(try image.validate())
+    image.file_format = "HEIC"
+
+## Decodes the primary image into `image.pixels`, which the caller allocated after `probe`.
+## Values are the image's integer units: 0-255, or 0-65535 above 8 bits. Grid tiles and
+## the color conversion run on up to `threads` threads.
+pub func decode(image: Raster*, threads: usize = 1) -> !:
+    var heif: Heif
+    defer heif.close()
+    try parse_heif(image.encoded, &heif)
+    let layout = try describe(&heif)
+    let count: usize = (1 if layout.monochrome else 3) + (1 if layout.alpha != 0 else 0)
+    if layout.width != image.width or layout.height != image.height or count != image.channels.length or image.pixels.length != layout.width * layout.height * count:
+        error(invalid, "HEIC raster does not match its probe or its pixels are not allocated")
+    var planes: Planes
+    defer planes.close()
+    try render(&heif, &layout, &planes, image.max_bytes, image.max_pixels, threads)
+    try convert(&planes, &layout, image.pixels, threads)
+
+## Decodes the primary image of the HEIF file in `data` into `planes`, with its alpha plane
+## when the file has one, for callers that do their own color conversion. Grid tiles
+## decode on up to `threads` threads.
+pub func decode_planes(data: const u8[], planes: Planes*, max_bytes: usize = 1073741824, max_pixels: usize = 268435456, threads: usize = 1) -> !:
+    var heif: Heif
+    defer heif.close()
+    try parse_heif(data, &heif)
+    let layout = try describe(&heif)
+    planes.close()
+    try render(&heif, &layout, planes, max_bytes, max_pixels, threads)

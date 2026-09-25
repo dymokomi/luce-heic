@@ -1,0 +1,191 @@
+#==============================================================================================
+#
+#   heic/picture - A picture being decoded: sample planes, per-block maps and tile scan
+#
+#   Block state is kept per 4x4 luma unit (the smallest transform and prediction block):
+#   the luma intra mode, QpY, coding-tree depth and flags. CTB state is kept per CTB in
+#   raster order: the slice it belongs to, its tile and its SAO parameters.
+#
+#==============================================================================================
+
+# Per-unit flags.
+let unit_decoded: u8 = 1
+let unit_unfiltered: u8 = 2
+let unit_edge_left: u8 = 4
+let unit_edge_top: u8 = 8
+
+## SAO parameters of one CTB: per component the type (0 none, 1 band, 2 edge), the band
+## position or edge class, and the four offsets.
+struct Sao:
+    var kind: u8[3]
+    var detail: u8[3]
+    var offsets: i16[12]
+
+## What the loop filters need from each slice.
+struct SliceInfo:
+    var address: usize
+    var deblock_disabled: bool
+    var beta_offset: i32
+    var tc_offset: i32
+    var across_slices: bool
+
+## A picture at its coded size, with the maps its parsing and filters use.
+struct Picture:
+    var width: usize
+    var height: usize
+    var chroma: u32
+    var bits: u32
+    var bits_c: u32
+    var luma: u16[]
+    var cb: u16[]
+    var cr: u16[]
+    var cwidth: usize
+    var cheight: usize
+    var units_w: usize
+    var units_h: usize
+    var modes: u8[]
+    var qps: i8[]
+    var depths: u8[]
+    var flags: u8[]
+    var log2_ctb: u32
+    var ctbs_w: usize
+    var ctbs_h: usize
+    ## One more than the index in `slices` of each CTB's slice segment; 0 before decoding.
+    var ctb_slice: u32[]
+    var ctb_tile: u32[]
+    var rs_to_ts: u32[]
+    var ts_to_rs: u32[]
+    ## The first CTB column and row of every tile column and row, and one past the last.
+    var tile_columns: usize
+    var column_starts: usize[65]
+    var row_starts: usize[65]
+    var sao: Sao[]
+    var slices: SliceInfo[]
+    var slice_count: usize
+    var across_tiles: bool
+    var cb_offset: i32
+    var cr_offset: i32
+    var pcm_loop_filter_disabled: bool
+    ## Conformance window and VUI video signal type of the SPS.
+    var crop_left: usize
+    var crop_right: usize
+    var crop_top: usize
+    var crop_bottom: usize
+    var full_range: i32
+    var matrix: i32
+
+    mutating func close():
+        with memory.heap:
+            for plane in [self.luma, self.cb, self.cr]:
+                if plane.length > 0:
+                    free(plane)
+            for map in [self.modes, self.depths, self.flags]:
+                if map.length > 0:
+                    free(map)
+            if self.qps.length > 0:
+                free(self.qps)
+            for table in [self.ctb_slice, self.ctb_tile, self.rs_to_ts, self.ts_to_rs]:
+                if table.length > 0:
+                    free(table)
+            if self.sao.length > 0:
+                free(self.sao)
+            if self.slices.length > 0:
+                free(self.slices)
+        self = Picture()
+
+    ## The plane of component `c` (0 luma, 1 Cb, 2 Cr).
+    func plane(c: u32) -> u16[]:
+        return self.luma if c == 0 else self.cb if c == 1 else self.cr
+
+    ## The index of the 4x4 unit holding luma sample (x, y).
+    func unit_at(x: usize, y: usize) -> usize:
+        return (y >> 2) * self.units_w + (x >> 2)
+
+    ## The raster address of the CTB holding luma sample (x, y).
+    func ctb(x: usize, y: usize) -> usize:
+        return (y >> self.log2_ctb) * self.ctbs_w + (x >> self.log2_ctb)
+
+    ## Sets `value` bits in the flags of every unit of the luma block (x, y, size).
+    mutating func mark(x: usize, y: usize, size: usize, value: u8):
+        for uy in (y >> 2)..<((y + size) >> 2):
+            for ux in (x >> 2)..<((x + size) >> 2):
+                self.flags[uy * self.units_w + ux] |= value
+
+    ## Stores the luma intra mode of the block (x, y, size).
+    mutating func set_mode(x: usize, y: usize, size: usize, mode: u8):
+        for uy in (y >> 2)..<((y + size) >> 2):
+            for ux in (x >> 2)..<((x + size) >> 2):
+                self.modes[uy * self.units_w + ux] = mode
+
+## Allocates `pic` for the active SPS and PPS and derives the tile scan (6.5.1).
+func allocate_picture(pic: Picture*, sps: const Sps*, pps: const Pps*, max_bytes: usize) -> !:
+    pic.width = sps.width
+    pic.height = sps.height
+    pic.chroma = sps.chroma
+    pic.bits = sps.bits
+    pic.bits_c = sps.bits_c
+    pic.log2_ctb = sps.log2_ctb
+    let ctb = (usize)1 << sps.log2_ctb
+    pic.ctbs_w = (sps.width + ctb - 1) >> sps.log2_ctb
+    pic.ctbs_h = (sps.height + ctb - 1) >> sps.log2_ctb
+    pic.units_w = sps.width >> 2
+    pic.units_h = sps.height >> 2
+    pic.cwidth = sps.width >> 1 if sps.chroma == 1 else 0
+    pic.cheight = sps.height >> 1 if sps.chroma == 1 else 0
+    let samples = sps.width * sps.height + 2 * pic.cwidth * pic.cheight
+    if samples * 3 + pic.units_w * pic.units_h * 5 > max_bytes:
+        error(limit, "HEVC picture exceeds the byte limit")
+    pic.crop_left = sps.crop_left
+    pic.crop_right = sps.crop_right
+    pic.crop_top = sps.crop_top
+    pic.crop_bottom = sps.crop_bottom
+    pic.full_range = sps.full_range
+    pic.matrix = sps.matrix
+    pic.pcm_loop_filter_disabled = sps.pcm and sps.pcm_loop_filter_disabled
+    pic.across_tiles = pps.across_tiles
+    pic.cb_offset = pps.cb_offset
+    pic.cr_offset = pps.cr_offset
+    let ctbs = pic.ctbs_w * pic.ctbs_h
+    with memory.heap:
+        pic.luma = try new u16[sps.width * sps.height]
+        if sps.chroma == 1:
+            pic.cb = try new u16[pic.cwidth * pic.cheight]
+            pic.cr = try new u16[pic.cwidth * pic.cheight]
+        let units = pic.units_w * pic.units_h
+        pic.modes = try new u8[units]
+        pic.qps = try new i8[units]
+        pic.depths = try new u8[units]
+        pic.flags = try new u8[units]
+        pic.ctb_slice = try new u32[ctbs]
+        pic.ctb_tile = try new u32[ctbs]
+        pic.rs_to_ts = try new u32[ctbs]
+        pic.ts_to_rs = try new u32[ctbs]
+        pic.sao = try new Sao[ctbs]
+        pic.slices = try new SliceInfo[ctbs]
+    if pps.columns > pic.ctbs_w or pps.rows > pic.ctbs_h:
+        error(corrupt, "HEVC picture has more tiles than CTBs")
+    pic.tile_columns = pps.columns
+    try tile_starts(pic.column_starts, pps.columns, pic.ctbs_w, pps.uniform, pps.column_widths)
+    try tile_starts(pic.row_starts, pps.rows, pic.ctbs_h, pps.uniform, pps.row_heights)
+    # CtbAddrRsToTs and TileId (6-5, 6-7), walking tiles in raster order.
+    var ts: usize = 0
+    for tile_row in 0..<pps.rows:
+        for tile_column in 0..<pps.columns:
+            for y in pic.row_starts[tile_row]..<pic.row_starts[tile_row + 1]:
+                for x in pic.column_starts[tile_column]..<pic.column_starts[tile_column + 1]:
+                    let rs = y * pic.ctbs_w + x
+                    pic.rs_to_ts[rs] = (u32)ts
+                    pic.ts_to_rs[ts] = (u32)rs
+                    pic.ctb_tile[rs] = (u32)(tile_row * pps.columns + tile_column)
+                    ts += 1
+
+## The starts of `count` tile columns (or rows) over `total` CTBs, uniform or explicit.
+func tile_starts(starts: usize[], count: usize, total: usize, uniform: bool, sizes: const u32[]) -> !:
+    starts[0] = 0
+    for i in 0..<count:
+        var size = (i + 1) * total // count - i * total // count if uniform else (usize)sizes[i]
+        if i == count - 1:
+            if starts[i] >= total:
+                error(corrupt, "HEVC tile sizes exceed the picture")
+            size = total - starts[i]
+        starts[i + 1] = starts[i] + size

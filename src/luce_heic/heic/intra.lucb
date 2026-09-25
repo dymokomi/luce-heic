@@ -1,0 +1,168 @@
+#==============================================================================================
+#
+#   heic/intra - Intra sample prediction (8.4.4.2): reference samples with availability and
+#   substitution, [1 2 1] and strong (bilinear) smoothing, planar, DC and the 33 angular
+#   modes with their boundary filters.
+#
+#   The references are kept as one line of 4N + 1 samples running from the bottom of the
+#   left column (p[-1][2N-1]) up to the corner (p[-1][-1]) and along the top row to
+#   p[2N-1][-1], so substitution and smoothing are single passes along it.
+#
+#==============================================================================================
+
+## intraPredAngle for modes 2 to 34.
+let intra_angle: i32[35] = [0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26, -32, -26, -21, -17, -13, -9, -5, -2, 0, 2, 5, 9, 13, 17, 21, 26, 32]
+
+## invAngle for modes 11 to 25.
+let inverse_angle: i32[15] = [-4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390, -482, -630, -910, -1638, -4096]
+
+## Predicts the 2^log2 block of component `component` at (x0, y0) of that component's
+## samples with intra mode `mode`, writing the prediction into the plane.
+func predict(c: Ctx*, component: u32, x0: usize, y0: usize, log2: u32, mode: u32):
+    let pic = c.pic
+    let n = (usize)1 << log2
+    let luma = component == 0
+    let scale: usize = 0 if luma else 1
+    let plane = pic.plane(component)
+    let stride = pic.width if luma else pic.cwidth
+    let depth = pic.bits if luma else pic.bits_c
+    # Gather: line[2N - 1 - y] = p[-1][y], line[2N] = p[-1][-1], line[2N + 1 + x] = p[x][-1].
+    let total = 4 * n + 1
+    var line: i32[129] = ---
+    var present: bool[129] = ---
+    for k in 0..<total:
+        present[k] = false
+    let corner = 2 * n
+    let group = (usize)4 >> scale
+    var any = false
+    if x0 > 0:
+        var y: usize = 0
+        while y < 2 * n:
+            if c.available((x0 - 1) << scale, (y0 + y) << scale):
+                for k in y..<y + group:
+                    line[corner - 1 - k] = (i32)plane[(y0 + k) * stride + x0 - 1]
+                    present[corner - 1 - k] = true
+                any = true
+            y += group
+        if y0 > 0 and c.available((x0 - 1) << scale, (y0 - 1) << scale):
+            line[corner] = (i32)plane[(y0 - 1) * stride + x0 - 1]
+            present[corner] = true
+            any = true
+    if y0 > 0:
+        var x: usize = 0
+        while x < 2 * n:
+            if c.available((x0 + x) << scale, (y0 - 1) << scale):
+                for k in x..<x + group:
+                    line[corner + 1 + k] = (i32)plane[(y0 - 1) * stride + x0 + k]
+                    present[corner + 1 + k] = true
+                any = true
+            x += group
+    # Substitution (8.4.4.2.2).
+    if not any:
+        for k in 0..<total:
+            line[k] = (i32)1 << (depth - 1)
+    else:
+        if not present[0]:
+            var k: usize = 1
+            while not present[k]:
+                k += 1
+            line[0] = line[k]
+        for k in 1..<total:
+            if not present[k]:
+                line[k] = line[k - 1]
+    # Filtering (8.4.4.2.3), luma only for 4:2:0.
+    if luma and mode != 1 and n > 4:
+        let distance = min_u32(abs_diff(mode, 26), abs_diff(mode, 10))
+        let threshold: u32 = 7 if n == 8 else 1 if n == 16 else 0
+        if distance > threshold:
+            let flat = (i32)1 << (depth - 5)
+            if c.sps.strong_smoothing and n == 32 and abs_i32(line[corner] + line[total - 1] - 2 * line[corner + n]) < flat and abs_i32(line[corner] + line[0] - 2 * line[corner - n]) < flat:
+                let low = line[0]
+                let mid = line[corner]
+                let high = line[total - 1]
+                for k in 1..<corner:
+                    # p[-1][y] with y = 63 - k.
+                    line[k] = ((i32)k * mid + (64 - (i32)k) * low + 32) >> 6
+                for k in 1..<corner:
+                    line[corner + k] = ((64 - (i32)k) * mid + (i32)k * high + 32) >> 6
+            else:
+                var previous = line[0]
+                for k in 1..<total - 1:
+                    let current = line[k]
+                    line[k] = (previous + 2 * current + line[k + 1] + 2) >> 2
+                    previous = current
+    let high = ((i32)1 << depth) - 1
+    if mode == 0:
+        # Planar.
+        let top_right = line[corner + 1 + n]
+        let bottom_left = line[corner - 1 - n]
+        for y in 0..<n:
+            for x in 0..<n:
+                let v = (i32)(n - 1 - x) * line[corner - 1 - y] + (i32)(x + 1) * top_right + (i32)(n - 1 - y) * line[corner + 1 + x] + (i32)(y + 1) * bottom_left + (i32)n
+                plane[(y0 + y) * stride + x0 + x] = (u16)(v >> (log2 + 1))
+        return
+    if mode == 1:
+        # DC, with the edge filter for luma blocks below 32x32.
+        var sum = (i32)n
+        for k in 0..<n:
+            sum += line[corner + 1 + k] + line[corner - 1 - k]
+        let dc = sum >> (log2 + 1)
+        for y in 0..<n:
+            for x in 0..<n:
+                plane[(y0 + y) * stride + x0 + x] = (u16)dc
+        if luma and n < 32:
+            plane[y0 * stride + x0] = (u16)((line[corner - 1] + 2 * dc + line[corner + 1] + 2) >> 2)
+            for x in 1..<n:
+                plane[y0 * stride + x0 + x] = (u16)((line[corner + 1 + x] + 3 * dc + 2) >> 2)
+            for y in 1..<n:
+                plane[(y0 + y) * stride + x0] = (u16)((line[corner - 1 - y] + 3 * dc + 2) >> 2)
+        return
+    # Angular: build ref[] (offset by n so negative indices fit) along the main direction.
+    let vertical = mode >= 18
+    let angle = intra_angle[mode]
+    var reference: i32[200] = ---
+    let base = n
+    for k in 0..=n:
+        # ref[k] = p[-1 + k][-1] (vertical) or p[-1][-1 + k] (horizontal).
+        reference[base + k] = line[corner + k] if vertical else line[corner - k]
+    if angle < 0:
+        let lowest = ((i32)n * angle) >> 5
+        if lowest < -1:
+            let inverse = inverse_angle[mode - 11]
+            var k = lowest
+            while k <= -1:
+                let index = -1 + ((k * inverse + 128) >> 8)
+                # The side reference p[-1][index] (vertical) or p[index][-1] (horizontal).
+                reference[(usize)((i32)base + k)] = line[corner - 1 - (usize)index] if vertical else line[corner + 1 + (usize)index]
+                k += 1
+    else:
+        for k in n + 1..=2 * n:
+            reference[base + k] = line[corner + k] if vertical else line[corner - k]
+    for j in 0..<n:
+        let position = ((i32)j + 1) * angle
+        let offset = position >> 5
+        let fraction = position & 31
+        for i in 0..<n:
+            let index = (usize)((i32)(base + i) + offset + 1)
+            let v = ((32 - fraction) * reference[index] + fraction * reference[index + 1] + 16) >> 5 if fraction != 0 else reference[index]
+            if vertical:
+                plane[(y0 + j) * stride + x0 + i] = (u16)v
+            else:
+                plane[(y0 + i) * stride + x0 + j] = (u16)v
+    if luma and n < 32 and (mode == 26 or mode == 10):
+        for k in 0..<n:
+            if mode == 26:
+                let v = line[corner + 1] + ((line[corner - 1 - k] - line[corner]) >> 1)
+                plane[(y0 + k) * stride + x0] = (u16)(0 if v < 0 else high if v > high else v)
+            else:
+                let v = line[corner - 1] + ((line[corner + 1 + k] - line[corner]) >> 1)
+                plane[y0 * stride + x0 + k] = (u16)(0 if v < 0 else high if v > high else v)
+
+func abs_diff(a: u32, b: u32) -> u32:
+    return a - b if a > b else b - a
+
+func min_u32(a: u32, b: u32) -> u32:
+    return a if a < b else b
+
+func abs_i32(v: i32) -> i32:
+    return -v if v < 0 else v

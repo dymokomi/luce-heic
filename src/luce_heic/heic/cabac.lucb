@@ -1,0 +1,169 @@
+#==============================================================================================
+#
+#   heic/cabac - The CABAC arithmetic decoder and its context variables
+#
+#   The engine keeps the 9-bit offset scaled by 2^7 with up to seven prefetched bits below
+#   it, reading whole bytes. After a terminating bin equal to 1 (end of a substream or a
+#   pcm_flag) the bits already fetched are exactly the stop bit and its alignment, so the
+#   next substream starts at `position`. Only I slices exist here, so each context has the
+#   one initialisation value of initType 0.
+#
+#==============================================================================================
+
+# Context offsets, one run of contexts per syntax element.
+let ctx_sao_merge: usize = 0
+let ctx_sao_type: usize = 1
+let ctx_split_cu: usize = 2
+let ctx_bypass: usize = 5
+let ctx_part_mode: usize = 6
+let ctx_prev_intra: usize = 7
+let ctx_chroma_mode: usize = 8
+let ctx_split_tu: usize = 9
+let ctx_cbf_luma: usize = 12
+let ctx_cbf_chroma: usize = 14
+let ctx_transform_skip: usize = 19
+let ctx_qp_delta: usize = 21
+let ctx_last_x: usize = 23
+let ctx_last_y: usize = 41
+let ctx_csbf: usize = 59
+let ctx_sig: usize = 63
+let ctx_gt1: usize = 107
+let ctx_gt2: usize = 131
+let contexts: usize = 137
+
+## Tables 9-5 to 9-37: initValue of every context for initType 0, in the order above.
+let init_values: u8[137] = [
+    153, 200, 139, 141, 157, 154, 184, 184, 63, 153, 138, 138, 111, 141, 94, 138, 182, 154, 154, 139, 139, 154, 154,
+    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63,
+    110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63,
+    91, 171, 134, 141,
+    111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140, 139, 182, 182, 152, 136, 152, 136, 153, 136, 139, 111, 136, 139, 111, 141, 111,
+    140, 92, 137, 138, 140, 152, 138, 139, 153, 74, 149, 92, 139, 107, 122, 152, 140, 179, 166, 182, 140, 227, 122, 197,
+    138, 153, 136, 167, 152, 152,
+]
+
+## Table 9-46: rangeTabLps[pStateIdx][(ivlCurrRange >> 6) & 3].
+let range_lps: u8[256] = [
+    128, 176, 208, 240, 128, 167, 197, 227, 128, 158, 187, 216, 123, 150, 178, 205, 116, 142, 169, 195, 111, 135, 160, 185,
+    105, 128, 152, 175, 100, 122, 144, 166, 95, 116, 137, 158, 90, 110, 130, 150, 85, 104, 123, 142, 81, 99, 117, 135,
+    77, 94, 111, 128, 73, 89, 105, 122, 69, 85, 100, 116, 66, 80, 95, 110, 62, 76, 90, 104, 59, 72, 86, 99,
+    56, 69, 81, 94, 53, 65, 77, 89, 51, 62, 73, 85, 48, 59, 69, 80, 46, 56, 66, 76, 43, 53, 63, 72,
+    41, 50, 59, 69, 39, 48, 56, 65, 37, 45, 54, 62, 35, 43, 51, 59, 33, 41, 48, 56, 32, 39, 46, 53,
+    30, 37, 43, 50, 29, 35, 41, 48, 27, 33, 39, 45, 26, 31, 37, 43, 24, 30, 35, 41, 23, 28, 33, 39,
+    22, 27, 32, 37, 21, 26, 30, 35, 20, 24, 29, 33, 19, 23, 27, 31, 18, 22, 26, 30, 17, 21, 25, 28,
+    16, 20, 23, 27, 15, 19, 22, 25, 14, 18, 21, 24, 14, 17, 20, 23, 13, 16, 19, 22, 12, 15, 18, 21,
+    12, 14, 17, 20, 11, 14, 16, 19, 11, 13, 15, 18, 10, 12, 15, 17, 10, 12, 14, 16, 9, 11, 13, 15,
+    9, 11, 12, 14, 8, 10, 12, 14, 8, 9, 11, 13, 7, 9, 11, 12, 7, 9, 10, 12, 7, 8, 10, 11,
+    6, 8, 9, 11, 6, 7, 9, 10, 6, 7, 8, 9, 2, 2, 2, 2,
+]
+
+## Table 9-47: transIdxLps.
+let next_lps: u8[64] = [0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9, 11, 11, 12, 13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21, 21, 22, 22, 23, 24, 24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33, 33, 33, 34, 34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63]
+
+## The renormalisation shift after an LPS, by rangeTabLps >> 3.
+let renorm: u8[32] = [6, 5, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+
+## The arithmetic decoder over one slice segment's data. Each context state is
+## pStateIdx << 1 | valMps.
+struct Cabac:
+    var data: const u8[]
+    var position: usize
+    var value: u32
+    var range: u32
+    var needed: i32
+    var states: u8[137]
+
+    ## Initialises the engine (9.3.2.5) at byte `position`; contexts are untouched.
+    mutating func start(position: usize):
+        self.position = position
+        self.range = 510
+        self.needed = -8
+        self.value = (u32)self.fetch() << 8
+        self.value |= (u32)self.fetch()
+
+    ## The next byte, or zero past the end of the data.
+    mutating func fetch() -> u8:
+        if self.position >= self.data.length:
+            self.position += 1
+            return 0
+        let value = self.data[self.position]
+        self.position += 1
+        return value
+
+    ## Initialises every context for slice QP `qp` (9.3.2.2).
+    mutating func reset(qp: i32):
+        let q = 0 if qp < 0 else 51 if qp > 51 else qp
+        for i in 0..<contexts:
+            let init = (i32)init_values[i]
+            let m = (init >> 4) * 5 - 45
+            let n = ((init & 15) << 3) - 16
+            var state = ((m * q) >> 4) + n
+            state = 1 if state < 1 else 126 if state > 126 else state
+            self.states[i] = (u8)(((state - 64) << 1) | 1) if state > 63 else (u8)((63 - state) << 1)
+
+    ## A context-coded bin (9.3.4.3.2).
+    mutating func decode(context: usize) -> u32:
+        let s = (u32)self.states[context]
+        let state = s >> 1
+        let mps = s & 1
+        let lps = (u32)range_lps[(usize)((state << 2) | ((self.range >> 6) & 3))]
+        self.range -= lps
+        let scaled = self.range << 7
+        if self.value < scaled:
+            self.states[context] = (u8)(((state + 1 if state < 62 else 62) << 1) | mps)
+            if scaled < 32768:
+                self.range = scaled >> 6
+                self.value <<= 1
+                self.needed += 1
+                if self.needed == 0:
+                    self.needed = -8
+                    self.value |= (u32)self.fetch()
+            return mps
+        self.value -= scaled
+        let shift = (u32)renorm[(usize)(lps >> 3)]
+        self.value <<= shift
+        self.range = lps << shift
+        let flipped = 1 - mps if state == 0 else mps
+        self.states[context] = (u8)(((u32)next_lps[(usize)state] << 1) | flipped)
+        self.needed += (i32)shift
+        if self.needed >= 0:
+            self.value |= (u32)self.fetch() << (u32)self.needed
+            self.needed -= 8
+        return 1 - mps
+
+    ## A bypass bin (9.3.4.3.4).
+    mutating func bypass() -> u32:
+        self.value <<= 1
+        self.needed += 1
+        if self.needed >= 0:
+            self.needed = -8
+            self.value |= (u32)self.fetch()
+        let scaled = self.range << 7
+        if self.value >= scaled:
+            self.value -= scaled
+            return 1
+        return 0
+
+    ## `count` bypass bins, first bin most significant.
+    mutating func bypass_bits(count: u32) -> u32:
+        var value: u32 = 0
+        var left = count
+        while left > 0:
+            value = (value << 1) | self.bypass()
+            left -= 1
+        return value
+
+    ## A terminating bin (9.3.4.3.5).
+    mutating func terminate() -> u32:
+        self.range -= 2
+        let scaled = self.range << 7
+        if self.value >= scaled:
+            return 1
+        if scaled < 32768:
+            self.range = scaled >> 6
+            self.value <<= 1
+            self.needed += 1
+            if self.needed == 0:
+                self.needed = -8
+                self.value |= (u32)self.fetch()
+        return 0
