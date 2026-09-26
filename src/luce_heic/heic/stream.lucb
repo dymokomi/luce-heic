@@ -25,7 +25,9 @@ func decode_picture(config: const u8[], data: const u8[], pic: Picture*, max_byt
         try parameter_set(d, nal)
     var nals = Nals(data = data, size = hvcc.length_size)
     var c: Ctx*? = none
-    defer free_ctx(c)
+    defer:
+        if let ctx = c:
+            free(ctx) in memory.heap
     var previous = SliceHeader()
     while let nal = try nals.next():
         let kind = nal_type(nal)
@@ -63,10 +65,6 @@ func decode_picture(config: const u8[], data: const u8[], pic: Picture*, max_byt
             error(corrupt, "HEVC picture is missing slices")
     deblock(pic)
     try apply_sao(pic)
-
-func free_ctx(c: Ctx*?):
-    if let ctx = c:
-        free(ctx) in memory.heap
 
 ## Parses a VPS, SPS or PPS NAL unit (VPS is not needed).
 func parameter_set(d: Decoder*, nal: const u8[]) -> !:
