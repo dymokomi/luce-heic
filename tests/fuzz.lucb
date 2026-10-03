@@ -8,9 +8,9 @@
 #==============================================================================================
 
 import c
-import luce_std.files
+from luce_std import files
 import memory
-import luce_heic.heic
+from luce_heic import heic
 from luce_raster.model import Raster
 
 ## A 64-bit LCG.

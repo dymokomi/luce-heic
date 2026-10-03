@@ -12,11 +12,11 @@
 #==============================================================================================
 
 import c
-import luce_std.files
+from luce_std import files
 import memory
-import luce_heic.heic
-import luce_png.png
-import luce_compress.compress
+from luce_heic import heic
+from luce_png import png
+from luce_compress import compress
 from luce_raster.model import Raster
 
 ## A 64-bit LCG for deterministic mutations.

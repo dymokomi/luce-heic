@@ -8,10 +8,10 @@
 #==============================================================================================
 
 import c
-import luce_std.files
+from luce_std import files
 import memory
 import time
-import luce_heic.heic
+from luce_heic import heic
 from luce_raster.model import Raster
 
 func main(arguments: c.str[]) -> i32!:

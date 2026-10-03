@@ -33,7 +33,7 @@
 #==============================================================================================
 
 import memory
-import luce_std.math
+from luce_std import math
 import thread
 from luce_raster.binary import Reader, Buffer, slice
 from luce_raster.model import Raster, SampleType
