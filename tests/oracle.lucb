@@ -12,12 +12,12 @@
 #==============================================================================================
 
 import c
-import files
+import luce_std.files
 import memory
-import heic
-import png
-import compress
-from raster import Raster
+import luce_heic.heic
+import luce_png.png
+import luce_compress.compress
+from luce_raster.model import Raster
 
 ## A 64-bit LCG for deterministic mutations.
 struct Random:

@@ -8,11 +8,11 @@
 #==============================================================================================
 
 import c
-import files
+import luce_std.files
 import memory
 import time
-import heic
-from raster import Raster
+import luce_heic.heic
+from luce_raster.model import Raster
 
 func main(arguments: c.str[]) -> i32!:
     if arguments.length < 2:

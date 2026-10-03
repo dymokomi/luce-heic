@@ -10,7 +10,7 @@ STD = Path(os.environ.get("LUCE_STD") or ROOT.parent / "luce-base/src/std").reso
 env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=str(STD))
 (ROOT / "build").mkdir(exist_ok=True)
 for flags in [["--native"], ["--backend=c"]]:
-    subprocess.run([str(BASE), "test", str(ROOT / "src/luce_heic/heic"), *flags], env=env, check=True, timeout=600, cwd=ROOT)
+    subprocess.run([str(BASE), "test", str(ROOT / "src/heic"), *flags], env=env, check=True, timeout=600, cwd=ROOT)
 for name, flags in [("oracle", ["--native"]), ("oracle_c", ["--backend=c", "--release"])]:
     subprocess.run([str(BASE), "build", "oracle.lucb", *flags, "-o", str(ROOT / "build" / name)], env=env, check=True, timeout=600, cwd=ROOT / "tests")
     subprocess.run([str(ROOT / "build" / name), str(ROOT / "tests/corpus")], check=True, timeout=900)

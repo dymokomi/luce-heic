@@ -33,11 +33,11 @@
 #==============================================================================================
 
 import memory
-import math
+import luce_std.math
 import thread
-from binary import Reader, Buffer, slice
-from raster import Raster, SampleType
-from raster_errors import corrupt, unsupported, invalid, limit
+from luce_raster.binary import Reader, Buffer, slice
+from luce_raster.model import Raster, SampleType
+from luce_raster.errors import corrupt, unsupported, invalid, limit
 
 ## The decoded primary image before color conversion: planes at the image grid's size
 ## (tiles assembled, conformance window applied), not yet cropped by the clean aperture,

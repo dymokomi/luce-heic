@@ -8,7 +8,7 @@
 #
 #==============================================================================================
 
-import files
+import luce_std.files
 
 test "Exp-Golomb codes and emulation prevention":
     # 1 | 010 | 011 | 00100 | 00101: ue 0, 1, 2, then se +2 and -2.

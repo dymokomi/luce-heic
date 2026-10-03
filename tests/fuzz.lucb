@@ -8,10 +8,10 @@
 #==============================================================================================
 
 import c
-import files
+import luce_std.files
 import memory
-import heic
-from raster import Raster
+import luce_heic.heic
+from luce_raster.model import Raster
 
 ## A 64-bit LCG.
 struct Random:
