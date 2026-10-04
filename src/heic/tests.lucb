@@ -142,8 +142,11 @@ test "the container refuses what is not HEIF":
 test "a HEIC from macOS decodes: size, channels and sample range":
     var image = Raster()
     defer image.close()
-    with memory.heap:
-        image.encoded = try files.read("tests/corpus/sips_214x130.heic")
+    let file = try files.read("tests/corpus/sips_214x130.heic")
+    defer file.release()
+    # The raster frees its bytes on the heap, so it keeps a copy of them.
+    image.encoded = try alloc u8[file.value.length] in memory.heap
+    memory.copy(image.encoded, file.value, file.value.length)
     try probe(&image)
     assert(image.width == 214 and image.height == 130 and image.channels.length == 3 and image.file_format == "HEIC")
     try image.allocate()

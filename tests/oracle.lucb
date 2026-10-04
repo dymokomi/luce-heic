@@ -31,8 +31,11 @@ struct Random:
 func load(directory: str, name: str) -> u8[]!:
     var path: u8[1024]
     let text = try format(path, f"{directory}/{name}")
-    with memory.heap:
-        return try files.read((c.str)text)
+    let file = try files.read((c.str)text)
+    defer file.release()
+    let data = try alloc u8[file.value.length] in memory.heap
+    memory.copy(data, file.value, file.value.length)
+    return data
 
 ## The decoded planes serialised as FFmpeg writes raw video: bytes, or 16-bit little
 ## endian above 8 bits; luma, then Cb and Cr.

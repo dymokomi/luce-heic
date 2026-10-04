@@ -57,10 +57,9 @@ func main(arguments: c.str[]) -> i32!:
         variants = variants * 10 + (usize)(ch - '0')
     var total: usize = 0
     for f in 3..<arguments.length:
-        var data: u8[]
-        with memory.heap:
-            data = try files.read(arguments[f])
-        defer free(data) in memory.heap
+        let file = try files.read(arguments[f])
+        defer file.release()
+        let data = file.value
         let copy = try new u8[data.length] in memory.heap
         defer free(copy) in memory.heap
         for v in 0..<variants:
