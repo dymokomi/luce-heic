@@ -64,7 +64,7 @@ pub struct Planes:
     pub var tile_width: usize
     pub var tile_height: usize
 
-    pub mutating func close():
+    pub func close():
         with memory.heap:
             if self.luma.length > 0:
                 free(self.luma)
@@ -105,7 +105,7 @@ pub func probe(image: Raster*) -> !:
     try image.standard(count, .uint8 if layout.bits == 8 else .uint16)
     if layout.icc.length > 0:
         try image.attribute("icc_profile", "icc", layout.icc)
-    discard(try image.validate())
+    _ = try image.validate()
     image.file_format = "HEIC"
 
 ## Decodes the primary image into `image.pixels`, which the caller allocated after `probe`.

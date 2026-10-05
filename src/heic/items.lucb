@@ -142,7 +142,7 @@ func colr_property(heif: const Heif*, p: Box, layout: Layout*) -> !:
     var r = try p.reader(heif.data)
     let kind = (u32)(try r.uint(4))
     if kind == colr_nclx and layout.matrix < 0:
-        discard(try r.uint(4))
+        _ = try r.uint(4)
         layout.matrix = (i32)(try r.uint(2))
         layout.full_range = (i32)(try r.byte() >> 7)
     elif (kind == colr_prof or kind == colr_ricc) and layout.icc.length == 0:

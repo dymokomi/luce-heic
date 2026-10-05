@@ -38,7 +38,7 @@ func parse_slice_header(bits: Bits*, nal: u32, sps_table: const Sps[], pps_table
     var h = SliceHeader()
     h.first = try bits.flag()
     if nal >= 16 and nal <= 23:
-        discard(try bits.flag())
+        _ = try bits.flag()
     h.pps = try bits.ue_max(63)
     let pps = &pps_table[(usize)h.pps]
     if not pps.present or not sps_table[(usize)pps.sps].present:
@@ -64,13 +64,13 @@ func parse_slice_header(bits: Bits*, nal: u32, sps_table: const Sps[], pps_table
         if kind != 2:
             error(unsupported, "HEVC P and B slices are not supported: only intra-coded images decode")
         if pps.output_flag:
-            discard(try bits.flag())
+            _ = try bits.flag()
         if nal != 19 and nal != 20:
-            discard(try bits.bits(sps.log2_poc))
+            _ = try bits.bits(sps.log2_poc)
             if not try bits.flag():
                 try skip_rps(bits, sps)
             elif sps.rps_count > 1:
-                discard(try bits.bits(ceil_log2((usize)sps.rps_count)))
+                _ = try bits.bits(ceil_log2((usize)sps.rps_count))
             if sps.long_term:
                 var from_sps: u32 = 0
                 if sps.long_term_count > 0:
@@ -79,14 +79,14 @@ func parse_slice_header(bits: Bits*, nal: u32, sps_table: const Sps[], pps_table
                 for i in 0..<count:
                     if i < from_sps:
                         if sps.long_term_count > 1:
-                            discard(try bits.bits(ceil_log2((usize)sps.long_term_count)))
+                            _ = try bits.bits(ceil_log2((usize)sps.long_term_count))
                     else:
-                        discard(try bits.bits(sps.log2_poc))
-                        discard(try bits.flag())
+                        _ = try bits.bits(sps.log2_poc)
+                        _ = try bits.flag()
                     if try bits.flag():
-                        discard(try bits.ue())
+                        _ = try bits.ue()
             if sps.temporal_mvp:
-                discard(try bits.flag())
+                _ = try bits.flag()
         if sps.sao:
             h.sao_luma = try bits.flag()
             if sps.chroma != 0:

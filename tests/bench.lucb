@@ -28,7 +28,7 @@ func main(arguments: c.str[]) -> i32!:
     let file = try files.read(arguments[1])
     defer file.release()
     # The raster frees its bytes on the heap, so it keeps a copy of them.
-    raster.encoded = try alloc u8[file.value.length] in memory.heap
+    raster.encoded = try new u8[file.value.length] --- in memory.heap
     memory.copy(raster.encoded, file.value, file.value.length)
     var best_planes: u64 = ~(u64)0
     var best_full: u64 = ~(u64)0

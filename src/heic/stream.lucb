@@ -40,7 +40,7 @@ func decode_picture(config: const u8[], data: const u8[], pic: Picture*, max_byt
             if c == none:
                 try parameter_set(d, nal)
             continue
-        let rbsp = try alloc u8[nal.length] in memory.heap
+        let rbsp = try new u8[nal.length] --- in memory.heap
         defer free(rbsp) in memory.heap
         let length = unescape(nal[2..], rbsp)
         var bits = Bits(data = rbsp[..<length])
@@ -71,7 +71,7 @@ func parameter_set(d: Decoder*, nal: const u8[]) -> !:
     let kind = nal_type(nal)
     if kind != nal_sps and kind != nal_pps:
         return
-    let rbsp = try alloc u8[nal.length] in memory.heap
+    let rbsp = try new u8[nal.length] --- in memory.heap
     defer free(rbsp) in memory.heap
     var bits = Bits(data = rbsp[..<unescape(nal[2..], rbsp)])
     if kind == nal_sps:

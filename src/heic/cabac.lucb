@@ -74,7 +74,7 @@ struct Cabac:
     var states: u8[137]
 
     ## Initialises the engine (9.3.2.5) at byte `position`; contexts are untouched.
-    mutating func start(position: usize):
+    func start(position: usize):
         self.position = position
         self.range = 510
         self.needed = -8
@@ -82,7 +82,7 @@ struct Cabac:
         self.value |= (u32)self.fetch()
 
     ## The next byte, or zero past the end of the data.
-    mutating func fetch() -> u8:
+    func fetch() -> u8:
         if self.position >= self.data.length:
             self.position += 1
             return 0
@@ -91,7 +91,7 @@ struct Cabac:
         return value
 
     ## Initialises every context for slice QP `qp` (9.3.2.2).
-    mutating func reset(qp: i32):
+    func reset(qp: i32):
         let q = 0 if qp < 0 else 51 if qp > 51 else qp
         for i in 0..<contexts:
             let init = (i32)init_values[i]
@@ -102,7 +102,7 @@ struct Cabac:
             self.states[i] = (u8)(((state - 64) << 1) | 1) if state > 63 else (u8)((63 - state) << 1)
 
     ## A context-coded bin (9.3.4.3.2).
-    mutating func decode(context: usize) -> u32:
+    func decode(context: usize) -> u32:
         let s = (u32)self.states[context]
         let state = s >> 1
         let mps = s & 1
@@ -132,7 +132,7 @@ struct Cabac:
         return 1 - mps
 
     ## A bypass bin (9.3.4.3.4).
-    mutating func bypass() -> u32:
+    func bypass() -> u32:
         self.value <<= 1
         self.needed += 1
         if self.needed >= 0:
@@ -145,7 +145,7 @@ struct Cabac:
         return 0
 
     ## `count` bypass bins, first bin most significant.
-    mutating func bypass_bits(count: u32) -> u32:
+    func bypass_bits(count: u32) -> u32:
         var value: u32 = 0
         var left = count
         while left > 0:
@@ -154,7 +154,7 @@ struct Cabac:
         return value
 
     ## A terminating bin (9.3.4.3.5).
-    mutating func terminate() -> u32:
+    func terminate() -> u32:
         self.range -= 2
         let scaled = self.range << 7
         if self.value >= scaled:

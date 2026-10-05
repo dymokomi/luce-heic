@@ -74,7 +74,7 @@ struct Picture:
     var full_range: i32
     var matrix: i32
 
-    mutating func close():
+    func close():
         with memory.heap:
             for plane in [self.luma, self.cb, self.cr]:
                 if plane.length > 0:
@@ -106,13 +106,13 @@ struct Picture:
         return (y >> self.log2_ctb) * self.ctbs_w + (x >> self.log2_ctb)
 
     ## Sets `value` bits in the flags of every unit of the luma block (x, y, size).
-    mutating func mark(x: usize, y: usize, size: usize, value: u8):
+    func mark(x: usize, y: usize, size: usize, value: u8):
         for uy in (y >> 2)..<((y + size) >> 2):
             for ux in (x >> 2)..<((x + size) >> 2):
                 self.flags[uy * self.units_w + ux] |= value
 
     ## Stores the luma intra mode of the block (x, y, size).
-    mutating func set_mode(x: usize, y: usize, size: usize, mode: u8):
+    func set_mode(x: usize, y: usize, size: usize, mode: u8):
         for uy in (y >> 2)..<((y + size) >> 2):
             for ux in (x >> 2)..<((x + size) >> 2):
                 self.modes[uy * self.units_w + ux] = mode

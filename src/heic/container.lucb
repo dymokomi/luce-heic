@@ -118,7 +118,7 @@ struct Heif:
     var idat: Box
     var primary: u32
 
-    mutating func close():
+    func close():
         with memory.heap:
             if self.items.length > 0:
                 free(self.items)
@@ -206,7 +206,7 @@ func parse_heif(data: const u8[], heif: Heif*) -> !:
         error(corrupt, "HEIF meta box lacks pitm or iinf")
     var pitm = try children[1].reader(data)
     let pitm_version = try pitm.byte()
-    discard(try pitm.take(3))
+    _ = try pitm.take(3)
     heif.primary = (u32)(try pitm.uint(2 if pitm_version == 0 else 4))
     heif.idat = children[6]
     try parse_iinf(heif, children[2])
@@ -221,7 +221,7 @@ func parse_heif(data: const u8[], heif: Heif*) -> !:
 func parse_iinf(heif: Heif*, box: Box) -> !:
     var r = try box.reader(heif.data)
     let version = try r.byte()
-    discard(try r.take(3))
+    _ = try r.take(3)
     let count = (usize)(try r.uint(2 if version == 0 else 4))
     if count > max_items or count > box.end - box.body:
         error(limit, "HEIF has too many items")
@@ -233,10 +233,10 @@ func parse_iinf(heif: Heif*, box: Box) -> !:
             error(corrupt, "HEIF iinf holds a box other than infe")
         var e = try b.reader(heif.data)
         let v = try e.byte()
-        discard(try e.uint(3))
+        _ = try e.uint(3)
         if v >= 2:
             heif.items[i].id = (u32)(try e.uint(2 if v == 2 else 4))
-            discard(try e.uint(2))
+            _ = try e.uint(2)
             heif.items[i].kind = (u32)(try e.uint(4))
         else:
             heif.items[i].id = (u32)(try e.uint(2))
@@ -248,7 +248,7 @@ func parse_iloc(heif: Heif*, box: Box) -> !:
     for pass in 0..<(usize)2:
         var r = try box.reader(heif.data)
         let version = try r.byte()
-        discard(try r.take(3))
+        _ = try r.take(3)
         if version > 2:
             error(unsupported, "unsupported HEIF iloc version")
         let sizes = try r.uint(2)
@@ -266,7 +266,7 @@ func parse_iloc(heif: Heif*, box: Box) -> !:
             var method: u32 = 0
             if version > 0:
                 method = (u32)(try r.uint(2)) & 15
-            discard(try r.uint(2))
+            _ = try r.uint(2)
             let base = try r.uint(base_size)
             let extents = (usize)(try r.uint(2))
             if pass == 1:
@@ -280,7 +280,7 @@ func parse_iloc(heif: Heif*, box: Box) -> !:
                 item.extent_count = extents
             for e in 0..<extents:
                 if index_size > 0:
-                    discard(try r.uint(index_size))
+                    _ = try r.uint(index_size)
                 let offset = try r.uint(offset_size)
                 let length = try r.uint(length_size)
                 if pass == 1:
@@ -339,7 +339,7 @@ func parse_iprp(heif: Heif*, box: Box) -> !:
 func parse_iref(heif: Heif*, box: Box) -> !:
     var r = try box.reader(heif.data)
     let version = try r.byte()
-    discard(try r.take(3))
+    _ = try r.take(3)
     let width: usize = 2 if version == 0 else 4
     heif.tiles = try new u32[(box.end - box.body) // 2] in memory.heap
     var position = box.body + 4

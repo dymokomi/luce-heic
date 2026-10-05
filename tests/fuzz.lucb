@@ -17,7 +17,7 @@ from luce_raster.model import Raster
 struct Random:
     var state: u64
 
-    mutating func below(bound: usize) -> usize:
+    func below(bound: usize) -> usize:
         self.state = self.state *% 6364136223846793005 +% 1442695040888963407
         return (usize)(self.state >> 33) % bound
 

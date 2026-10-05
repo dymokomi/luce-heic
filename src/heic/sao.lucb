@@ -26,7 +26,7 @@ func apply_sao(pic: Picture*) -> !:
         if not used:
             continue
         let plane = pic.plane(component)
-        let source = try alloc u16[plane.length] in memory.heap
+        let source = try new u16[plane.length] --- in memory.heap
         defer free(source) in memory.heap
         memory.copy(source, plane, plane.length)
         for rs in 0..<pic.sao.length:

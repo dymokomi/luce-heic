@@ -18,22 +18,23 @@ from luce_heic import heic
 from luce_png import png
 from luce_compress import compress
 from luce_raster.model import Raster
+import strings
 
 ## A 64-bit LCG for deterministic mutations.
 struct Random:
     var state: u64
 
-    mutating func below(bound: usize) -> usize:
+    func below(bound: usize) -> usize:
         self.state = self.state *% 6364136223846793005 +% 1442695040888963407
         return (usize)(self.state >> 33) % bound
 
 ## Reads corpus file `name` into heap memory.
 func load(directory: str, name: str) -> u8[]!:
     var path: u8[1024]
-    let text = try format(path, f"{directory}/{name}")
+    let text = try strings.format(path, f"{directory}/{name}")
     let file = try files.read((c.str)text)
     defer file.release()
-    let data = try alloc u8[file.value.length] in memory.heap
+    let data = try new u8[file.value.length] --- in memory.heap
     memory.copy(data, file.value, file.value.length)
     return data
 
@@ -105,7 +106,7 @@ func check_planes(directory: str, name: str, crc: u32) -> bool!:
     try heic.decode_planes(data, &again, threads = 3)
     let got = try planes_crc(&planes)
     let ok = got == crc and try planes_crc(&again) == crc
-    print(f"{"ok  " if ok else "FAIL"} {name}: {planes.width}x{planes.height} {planes.bits}-bit, planes CRC {hex(got)}, reference {hex(crc)}")
+    print(f"{"ok  " if ok else "FAIL"} {name}: {planes.width}x{planes.height} {planes.bits}-bit, planes CRC {got:x}, reference {crc:x}")
     return ok
 
 ## Decodes `variants` truncated and mutated copies of `name`; returns how many ran.

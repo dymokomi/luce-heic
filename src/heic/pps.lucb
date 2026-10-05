@@ -51,11 +51,11 @@ func parse_pps(bits: Bits*, table: Pps[]) -> !:
     pps.output_flag = try bits.flag()
     pps.extra_bits = try bits.bits(3)
     pps.sign_hiding = try bits.flag()
-    discard(try bits.flag())
-    discard(try bits.ue_max(14))
-    discard(try bits.ue_max(14))
+    _ = try bits.flag()
+    _ = try bits.ue_max(14)
+    _ = try bits.ue_max(14)
     pps.init_qp = 26 + try bits.se_range(-62, 25)
-    discard(try bits.flag())
+    _ = try bits.flag()
     pps.transform_skip = try bits.flag()
     pps.cu_qp_delta = try bits.flag()
     if pps.cu_qp_delta:
@@ -63,8 +63,8 @@ func parse_pps(bits: Bits*, table: Pps[]) -> !:
     pps.cb_offset = try bits.se_range(-12, 12)
     pps.cr_offset = try bits.se_range(-12, 12)
     pps.slice_chroma_offsets = try bits.flag()
-    discard(try bits.flag())
-    discard(try bits.flag())
+    _ = try bits.flag()
+    _ = try bits.flag()
     pps.bypass = try bits.flag()
     pps.tiles = try bits.flag()
     pps.wpp = try bits.flag()
@@ -90,8 +90,8 @@ func parse_pps(bits: Bits*, table: Pps[]) -> !:
     pps.scaling_present = try bits.flag()
     if pps.scaling_present:
         try parse_scaling(bits, &pps.scaling)
-    discard(try bits.flag())
-    discard(try bits.ue_max(4))
+    _ = try bits.flag()
+    _ = try bits.ue_max(4)
     pps.header_extension = try bits.flag()
     if try bits.flag():
         let range = try bits.flag()
@@ -112,30 +112,30 @@ func parse_vui(bits: Bits*, sps: Sps*, sub_layers: u32) -> !:
     if try bits.flag() and try bits.bits(8) == 255:
         try bits.skip(32)
     if try bits.flag():
-        discard(try bits.flag())
+        _ = try bits.flag()
     if try bits.flag():
-        discard(try bits.bits(3))
+        _ = try bits.bits(3)
         sps.full_range = (i32)(try bits.bit())
         if try bits.flag():
-            discard(try bits.bits(16))
+            _ = try bits.bits(16)
             sps.matrix = (i32)(try bits.bits(8))
     if try bits.flag():
-        discard(try bits.ue())
-        discard(try bits.ue())
+        _ = try bits.ue()
+        _ = try bits.ue()
     try bits.skip(3)
     if try bits.flag():
         for i in 0..<(usize)4:
-            discard(try bits.ue())
+            _ = try bits.ue()
     if try bits.flag():
         try bits.skip(64)
         if try bits.flag():
-            discard(try bits.ue())
+            _ = try bits.ue()
         if try bits.flag():
             try parse_hrd(bits, sub_layers)
     if try bits.flag():
         try bits.skip(3)
         for i in 0..<(usize)5:
-            discard(try bits.ue())
+            _ = try bits.ue()
 
 ## hrd_parameters(1, sub_layers), skipped.
 func parse_hrd(bits: Bits*, sub_layers: u32) -> !:
@@ -155,7 +155,7 @@ func parse_hrd(bits: Bits*, sub_layers: u32) -> !:
         let within = general or try bits.flag()
         var low_delay = false
         if within:
-            discard(try bits.ue())
+            _ = try bits.ue()
         else:
             low_delay = try bits.flag()
         var count: u32 = 1
@@ -163,9 +163,9 @@ func parse_hrd(bits: Bits*, sub_layers: u32) -> !:
             count = try bits.ue_max(31) + 1
         for layer in 0..<(usize)((1 if nal else 0) + (1 if vcl else 0)):
             for k in 0..<count:
-                discard(try bits.ue())
-                discard(try bits.ue())
+                _ = try bits.ue()
+                _ = try bits.ue()
                 if sub_picture:
-                    discard(try bits.ue())
-                    discard(try bits.ue())
-                discard(try bits.flag())
+                    _ = try bits.ue()
+                    _ = try bits.ue()
+                _ = try bits.flag()
