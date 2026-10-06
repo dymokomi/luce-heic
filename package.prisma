@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-heic" {
     str owner = "dymokomi"
-    str version = "0.5.0"
+    str version = "0.5.1"
     str kind = "package"
     str language = "luce-base"
     str description = "A HEIC/HEIF still-image decoder for Luce/Base: the HEIF container, grids, alpha and an intra HEVC decoder."
