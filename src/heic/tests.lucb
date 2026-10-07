@@ -2,7 +2,7 @@
 #
 #   heic/tests - Unit tests of the parts, and a decode of real files
 #
-#   The corpus gate (tests/oracle.lucb) checks whole files against macOS and FFmpeg; these
+#   The corpus gate (tests/oracle) checks whole files against macOS and FFmpeg; these
 #   tests pin down the pieces: bit reading, CABAC initialisation, scaling lists, the
 #   inverse transforms, intra prediction, the container and the output geometry.
 #

@@ -140,7 +140,7 @@ func fuzz(directory: str, name: str, random: Random*, variants: usize) -> usize!
 
 ## `oracle [corpus directory] [variants per file]`.
 func main(arguments: str[]) -> i32!:
-    let directory = arguments[1] if arguments.length > 1 else "corpus"
+    let directory = arguments[1] if arguments.length > 1 else "tests/corpus"
     let variants = (usize)(try number(arguments[2], 10)) if arguments.length > 2 else 60
     let manifest = try load(directory, "manifest.txt")
     defer free(manifest) in memory.heap

@@ -44,10 +44,10 @@ chroma bit depths that differ from luma.
 ## Tests
 
 ```
-./test.sh              # test blocks in native and C modes, then the corpus oracle both ways
+luc test               # test blocks, then the corpus oracle (tests/oracle)
 ```
 
-`tests/oracle.lucb` checks every file in `tests/corpus/manifest.txt`: HEIC files from macOS
+`tests/oracle` checks every file in `tests/corpus/manifest.txt`: HEIC files from macOS
 `sips` against sips's own decode (RGB within 1-3 levels), and streams from kvazaar, x265
 and a small PCM encoder (`tools/pcm_stream.py`) against FFmpeg's or the encoder's own
 reconstruction (bit-exact YCbCr planes). Each file also decodes again on worker threads to
