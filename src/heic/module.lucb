@@ -34,6 +34,7 @@
 
 import memory
 from luce_std import math
+import strings
 import thread
 from luce_raster.binary import Reader, Buffer, slice
 from luce_raster.model import Raster, SampleType

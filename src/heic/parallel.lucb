@@ -18,8 +18,10 @@ struct Pool:
     var count: usize
     var next: @usize
     var failed: @bool
+    ## The first failure: its message is copied into `room`, since the handler that caught it gives the original back when it finishes (base.md §11.3).
     var code: ErrorCode
     var message: str
+    var room: u8[256]
 
 ## A worker: runs tasks until none are left or one has failed.
 func work(raw: void*?):
@@ -32,7 +34,7 @@ func work(raw: void*?):
             let (won, seen) = pool.failed.cas(false, true, .acq_rel, .acquire)
             if won:
                 pool.code = failure.code
-                pool.message = failure.message
+                pool.message = strings.copy_into(pool.room, failure.message)
             return
 
 ## Runs `task(context, i)` for every i below `count` on up to `threads` threads, the
